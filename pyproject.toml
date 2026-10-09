@@ -16,6 +16,7 @@ dependencies = [
   "pandas",
   "psutil",
   "safetensors",
+  "torch>=2.7",
   "transformers==4.53.2",
 ]
 

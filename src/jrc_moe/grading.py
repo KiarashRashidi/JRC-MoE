@@ -68,16 +68,6 @@ GRADER_SPEC_SHA256 = hashlib.sha256(
     GRADER_SPEC_JSON.encode("utf-8")
 ).hexdigest()
 
-print(
-    json.dumps(
-        GRADER_SPEC,
-        indent=2,
-        ensure_ascii=False,
-    )
-)
-print("\nSHA256:", GRADER_SPEC_SHA256)
-
-
 # 3.1 Numeric token grammar
 
 NUMBER_TOKEN_PATTERN = r"""
@@ -164,9 +154,6 @@ CONCLUSION_CUE_RE = re.compile(
     """,
     flags=re.VERBOSE | re.IGNORECASE | re.MULTILINE,
 )
-
-print("Regexes compiled.")
-
 
 # 3.2 Exact numeric normalization
 
