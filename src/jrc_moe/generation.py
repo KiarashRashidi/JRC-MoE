@@ -1,6 +1,7 @@
 """Threshold decoder, routing-mode inference, and trace gates."""
 from collections import defaultdict
 import math, re, time
+import copy
 import numpy as np
 import pandas as pd
 import torch
@@ -58,33 +59,57 @@ def generate_with_routing_mode(
     prompt_ids,
     mode,
     controller,
+    *,
+    allocation_provider=None,
+    before_forward=None,
+    resume_state=None,
+    branch="control",
+    exchange=None,
+    checkpoint_revision=None,
+    config_digest=None,
+    sampler_settings=None,
 ):
     prompt_ids = prompt_ids.to(resolve_input_device(model))
 
     prompt_len = int(prompt_ids.shape[1])
     total_len = prompt_len + GEN_LENGTH
 
-    x = torch.full(
-        (1, total_len),
-        MASK_ID,
-        dtype=torch.long,
-        device=prompt_ids.device,
-    )
-    x[:, :prompt_len] = prompt_ids
-
-    # absolute target position -> prior confidence observations
-    confidence_history = defaultdict(list)
-
-    trace = []
-    total_pairs = 0
-    global_nfe = 0
+    if resume_state is None:
+        x = torch.full(
+            (1, total_len),
+            MASK_ID,
+            dtype=torch.long,
+            device=prompt_ids.device,
+        )
+        x[:, :prompt_len] = prompt_ids
+        confidence_history = defaultdict(list)
+        trace = []
+        total_pairs = 0
+        global_nfe = 0
+        start_block = 0
+        restored_local_nfe = 0
+        prefix_seconds = 0.0
+    else:
+        if tuple(resume_state.input_ids.shape) != (1, total_len):
+            raise ValueError("ReplayState token shape does not match this prompt and generation length")
+        x = resume_state.input_ids.to(prompt_ids.device).clone()
+        confidence_history = defaultdict(list, copy.deepcopy(resume_state.confidence_history))
+        trace = copy.deepcopy(resume_state.metadata.get("trace_prefix", []))
+        total_pairs = int(resume_state.decoder_counters.get("total_pairs", 0))
+        global_nfe = int(resume_state.global_nfe)
+        start_block = int(resume_state.block_idx)
+        restored_local_nfe = int(resume_state.local_nfe)
+        prefix_seconds = float(resume_state.metadata.get("prefix_seconds", 0.0))
+        resume_state.restore_rng()
 
     run_start = time.perf_counter()
 
-    for block_idx in range(NUM_BLOCKS):
+    replay_first_forward = resume_state is not None
+
+    for block_idx in range(start_block, NUM_BLOCKS):
         abs_start = prompt_len + block_idx * BLOCK_LENGTH
         abs_end = abs_start + BLOCK_LENGTH
-        local_nfe = 0
+        local_nfe = restored_local_nfe if replay_first_forward else 0
 
         while True:
             active_tokens = x[0, abs_start:abs_end]
@@ -95,8 +120,10 @@ def generate_with_routing_mode(
             if masked_before == 0:
                 break
 
-            local_nfe += 1
-            global_nfe += 1
+            restored_this_forward = replay_first_forward
+            if not restored_this_forward:
+                local_nfe += 1
+                global_nfe += 1
 
             unresolved_local = (
                 torch.where(active_mask)[0]
@@ -109,19 +136,75 @@ def generate_with_routing_mode(
                 for p in unresolved_local
             ]
 
-            # Allocation is determined before this model forward.
-            k_counts, fger_meta = allocation_for_forward(
-                mode,
-                prompt_len,
-                block_idx,
-                unresolved_abs,
-                confidence_history,
-            )
+            # Existing REFLEX callers use the untouched allocator/controller path.
+            # JRC-v4 may provide a layer-by-position allocation and restore a saved state.
+            if restored_this_forward:
+                k_counts = resume_state.k_by_layer
+                fger_meta = copy.deepcopy(resume_state.metadata.get("fger_meta"))
+            elif allocation_provider is not None:
+                allocation = allocation_provider(
+                    mode=mode, prompt_len=prompt_len, block_idx=block_idx,
+                    unresolved_abs=unresolved_abs, confidence_history=confidence_history,
+                    global_nfe=global_nfe,
+                )
+                if isinstance(allocation, tuple) and len(allocation) == 2:
+                    k_counts, fger_meta = allocation
+                else:
+                    k_counts, fger_meta = allocation, None
+            else:
+                k_counts, fger_meta = allocation_for_forward(
+                    mode,
+                    prompt_len,
+                    block_idx,
+                    unresolved_abs,
+                    confidence_history,
+                )
 
-            controller.begin_forward(k_counts)
+            from .jrc_v4.controller import LayerwiseKController
+            if isinstance(controller, LayerwiseKController):
+                controller.begin_forward(k_counts, global_nfe=global_nfe, branch=branch, exchange=exchange)
+            else:
+                if allocation_provider is not None or resume_state is not None:
+                    raise TypeError("layerwise allocations and replay require LayerwiseKController")
+                controller.begin_forward(k_counts)
 
-            t0 = time.perf_counter()
-            outputs = model(x)
+            try:
+                if before_forward is not None and not restored_this_forward:
+                    from .jrc_v4.replay import capture_replay_state
+                    k_matrix = k_counts
+                    if len(k_counts) > 0 and isinstance(k_counts[0], (int, float)):
+                        k_matrix = [list(k_counts) for _ in controller.module_names]
+                    state = capture_replay_state(
+                        input_ids=x,
+                        attention_mask=None,
+                        block_idx=block_idx,
+                        global_nfe=global_nfe,
+                        local_nfe=local_nfe,
+                        confidence_history=dict(confidence_history),
+                        decoder_counters={"total_pairs": total_pairs},
+                        sampler=dict(sampler_settings or {"generation_length": GEN_LENGTH, "block_length": BLOCK_LENGTH}),
+                        threshold=THETA,
+                        commit_policy="threshold_with_argmax_fallback",
+                        k_by_layer=tuple(tuple(int(v) for v in row) for row in k_matrix),
+                        checkpoint_revision=checkpoint_revision or "unverified",
+                        config_digest=config_digest or "unverified",
+                        metadata={"trace_prefix": trace, "fger_meta": fger_meta,
+                                  "prefix_seconds": time.perf_counter() - run_start,
+                                  "mode": mode, "prompt_length": prompt_len},
+                    )
+                    before_forward(state)
+
+                synchronized_timing = allocation_provider is not None or restored_this_forward
+                if synchronized_timing and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                outputs = model(x)
+                if synchronized_timing and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except BaseException:
+                if isinstance(controller, LayerwiseKController):
+                    controller.abort_forward()
+                raise
             forward_seconds = time.perf_counter() - t0
 
             pair_meta = controller.end_forward()
@@ -184,11 +267,23 @@ def generate_with_routing_mode(
                 (x[0, abs_start:abs_end] == MASK_ID).sum()
             )
 
+            k_tensor = torch.as_tensor(k_counts, dtype=torch.long)
             vals, freq = torch.unique(
-                k_counts,
+                k_tensor,
                 return_counts=True,
             )
             k_hist = dict(zip(vals.tolist(), freq.tolist()))
+            if k_tensor.ndim == 1:
+                forward_mean_k = float(k_tensor.float().mean())
+                layer_budgets = [int(k_tensor.sum())] * NUM_MOE_LAYERS
+                per_layer_budget = int(k_tensor.sum())
+            elif k_tensor.ndim == 2:
+                forward_mean_k = float(k_tensor.float().mean())
+                layer_budgets = [int(row.sum()) for row in k_tensor]
+                per_layer_budget = layer_budgets[0] if len(set(layer_budgets)) == 1 else None
+            else:
+                raise RuntimeError("K allocation must be [position] or [layer, position]")
+            layer_budget_extra = {"layer_budgets": layer_budgets} if k_tensor.ndim == 2 else {}
 
             trace.append({
                 "mode": mode,
@@ -209,8 +304,9 @@ def generate_with_routing_mode(
                 "active_conf_min": float(
                     active_conf[unresolved_local].min()
                 ),
-                "forward_mean_k": float(k_counts.float().mean()),
-                "per_layer_budget": int(k_counts.sum()),
+                "forward_mean_k": forward_mean_k,
+                "per_layer_budget": per_layer_budget,
+                **layer_budget_extra,
                 "direct_pairs": direct_pairs,
                 "k4_count": k_hist.get(4, 0),
                 "k6_count": k_hist.get(6, 0),
@@ -238,6 +334,15 @@ def generate_with_routing_mode(
             })
 
             del outputs, target_pred, target_conf
+            if restored_this_forward:
+                resume_state = None
+                replay_first_forward = False
+                restored_local_nfe = 0
+            elif replay_first_forward:
+                # The state is consumed exactly once, at its saved global/local NFE.
+                resume_state = None
+                replay_first_forward = False
+                restored_local_nfe = 0
 
     trace_df = pd.DataFrame(trace)
 
@@ -247,6 +352,7 @@ def generate_with_routing_mode(
         * global_nfe
     )
 
+    elapsed = float(time.perf_counter() - run_start)
     meta = {
         "mode": mode,
         "prompt_length": prompt_len,
@@ -255,10 +361,11 @@ def generate_with_routing_mode(
         "total_pairs": int(total_pairs),
         "pairs_m": float(total_pairs / 1e6),
         "avg_k": float(avg_k),
-        "generation_seconds": float(
-            time.perf_counter() - run_start
-        ),
+        "generation_seconds": float(prefix_seconds + elapsed),
     }
+    if allocation_provider is not None or resume_state is not None or before_forward is not None:
+        meta["continuation_seconds"] = elapsed
+        meta["shared_prefix_seconds"] = prefix_seconds
 
     return x, trace_df, meta
 

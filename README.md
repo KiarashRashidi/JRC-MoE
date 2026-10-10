@@ -31,6 +31,19 @@ jrc-moe run --fixed8-csv /path/to/validated_fixed8.csv --output-dir outputs/refl
 
 The run checks input schema and prompt-token counts, model architecture, routing allocation invariants, and per-forward traces. It resumes successful `(test_idx, mode)` rows from `results.jsonl`; traces and final summary files are written beside it. Use `--limit N` for an explicitly partial pilot. A partial run is not the 50×3 replication.
 
+## Gated JRC-MoE v4 experiments
+
+The new `jrc-moe jrc-v4` namespace keeps the REFLEX replication path separate. Begin with the offline audit; it records the environment, cache contents, historical Fixed8 input hash, and architecture details when the pinned model is already cached. It never downloads checkpoint weights. Smoke and pilot stages start no branches until the audit manifest records a passed G0.
+
+```bash
+jrc-moe jrc-v4 audit --config configs/jrc_v4/pilot.yaml --output-dir outputs/jrc_v4/audit
+python -m unittest discover -s tests -p 'test_jrc_v4_*.py' -v
+jrc-moe jrc-v4 smoke --config configs/jrc_v4/pilot.yaml --max-prompts 3 --max-branches 12 --output-dir outputs/jrc_v4/smoke
+jrc-moe jrc-v4 pilot --config configs/jrc_v4/pilot.yaml --max-prompts 50 --max-branches 200 --max-gpu-hours 24 --resume --output-dir outputs/jrc_v4/pilot
+```
+
+All new-run commands accept `--max-gpu-hours`, `--max-branches`, `--max-prompts`, `--max-wall-hours`, `--max-output-gb`, and `--resume`. See [docs/jrc_v4/runbook.md](docs/jrc_v4/runbook.md) for stage gates and artifact handling. Community, allocation, and systems stages remain conditional on earlier measured evidence.
+
 ## Git workflow
 
 The local repository and server checkout use `https://github.com/KiarashRashidi/JRC-MoE.git` as `origin`. Push and pull through the configured GitHub credentials on the machine doing the operation.

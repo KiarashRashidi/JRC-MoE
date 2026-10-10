@@ -1,0 +1,203 @@
+"""Layer-local K plans and one-shot, budget-neutral exchange overrides."""
+from dataclasses import dataclass
+from typing import Sequence
+
+
+@dataclass(frozen=True)
+class BudgetExchange:
+    global_nfe: int
+    layer_idx: int
+    recipient_position: int
+    donor_position: int
+    amount: int = 1
+
+    def validate(self, num_layers: int, sequence_length: int, min_k: int, max_k: int) -> None:
+        if self.global_nfe < 1 or not 0 <= self.layer_idx < num_layers:
+            raise ValueError("exchange NFE/layer is out of range")
+        if self.recipient_position == self.donor_position:
+            raise ValueError("recipient and donor must differ")
+        if not (0 <= self.recipient_position < sequence_length and 0 <= self.donor_position < sequence_length):
+            raise ValueError("exchange position is out of range")
+        if self.amount < 1 or min_k >= max_k:
+            raise ValueError("exchange amount/K bounds are invalid")
+
+
+class LayerwiseKController:
+    """Validate and expose [layer, position] K values for exactly one forward.
+
+    All inputs and accounting use Python values so CPU synthetic tests do not
+    require a model download. A Torch dispatcher can convert returned rows to
+    device tensors after the checkpoint routing semantics have been audited.
+    """
+
+    def __init__(self, expected_module_names: Sequence[str], *, min_k: int = 2, max_k: int = 8,
+                 monitored_layers: Sequence[int] = (), monitored_positions: Sequence[int] = ()):
+        self.module_names = tuple(expected_module_names)
+        if not self.module_names or len(set(self.module_names)) != len(self.module_names):
+            raise ValueError("expected module names must be nonempty and unique")
+        self.min_k, self.max_k = int(min_k), int(max_k)
+        if self.min_k < 1 or self.max_k < self.min_k:
+            raise ValueError("invalid K bounds")
+        self.monitored_layers = frozenset(int(i) for i in monitored_layers)
+        self.monitored_positions = frozenset(int(i) for i in monitored_positions)
+        if any(i < 0 or i >= len(self.module_names) for i in self.monitored_layers):
+            raise ValueError("monitored layer index out of range")
+        self.enabled = False
+        self._plan: tuple[tuple[int, ...], ...] | None = None
+        self._actual: list[list[int]] = []
+        self._global_nfe = 0
+        self._branch = "control"
+        self._exchange: BudgetExchange | None = None
+        self._calls: list[int] = []
+        self._observed_layer_pairs: list[int | None] = []
+        self._override_fires = 0
+        self._route_records: dict[tuple[int, int], dict] = {}
+
+    @property
+    def sequence_length(self) -> int | None:
+        return len(self._plan[0]) if self._plan else None
+
+    def begin_forward(self, k_by_layer: Sequence, *, global_nfe: int, branch: str = "control",
+                      exchange: BudgetExchange | None = None) -> None:
+        if self.enabled:
+            raise RuntimeError("previous K forward was not closed")
+        if branch not in {"control", "treatment"}:
+            raise ValueError("branch must be control or treatment")
+        rows = list(k_by_layer)
+        if rows and isinstance(rows[0], (int, float)):
+            rows = [list(k_by_layer) for _ in self.module_names]
+        if len(rows) != len(self.module_names) or not rows or not rows[0]:
+            raise ValueError("K plan must be [position] or [layer, position]")
+        width = len(rows[0])
+        matrix = []
+        for row in rows:
+            if len(row) != width:
+                raise ValueError("all layer K rows must have the same sequence length")
+            values = tuple(int(v) for v in row)
+            if any(v < self.min_k or v > self.max_k for v in values):
+                raise ValueError(f"K plan values must be in [{self.min_k}, {self.max_k}]")
+            matrix.append(values)
+        if global_nfe < 1:
+            raise ValueError("global_nfe is one-based and must be positive")
+        if exchange is not None:
+            exchange.validate(len(self.module_names), width, self.min_k, self.max_k)
+        if branch == "treatment" and exchange is None:
+            raise ValueError("treatment branch requires an exchange")
+        self._plan = tuple(matrix)
+        self._actual = [list(row) for row in matrix]
+        self._global_nfe = int(global_nfe)
+        self._branch = branch
+        self._exchange = exchange
+        self._calls = [0] * len(self.module_names)
+        self._observed_layer_pairs = [None] * len(self.module_names)
+        self._override_fires = 0
+        self._route_records = {}
+        self.enabled = True
+
+    def for_layer(self, layer_idx: int, module_name: str, sequence_length: int) -> tuple[int, ...]:
+        if not self.enabled or self._plan is None:
+            raise RuntimeError("begin_forward must be called before requesting a layer plan")
+        if not 0 <= layer_idx < len(self.module_names):
+            raise IndexError("layer index out of range")
+        if self.module_names[layer_idx] != module_name:
+            raise RuntimeError(f"module identity mismatch at layer {layer_idx}: {module_name!r}")
+        if sequence_length != len(self._plan[layer_idx]):
+            raise RuntimeError("allocation length does not match sequence length")
+        self._calls[layer_idx] += 1
+        if self._calls[layer_idx] != 1:
+            raise RuntimeError(f"layer {layer_idx} invoked more than once in one forward")
+        ex = self._exchange
+        if self._branch == "treatment" and ex and ex.global_nfe == self._global_nfe and ex.layer_idx == layer_idx:
+            if self._override_fires:
+                raise RuntimeError("exchange override fired more than once")
+            r, d = ex.recipient_position, ex.donor_position
+            if self._actual[layer_idx][r] + ex.amount > self.max_k:
+                raise ValueError("recipient would exceed Kmax")
+            if self._actual[layer_idx][d] - ex.amount < self.min_k:
+                raise ValueError("donor would fall below Kmin")
+            self._actual[layer_idx][r] += ex.amount
+            self._actual[layer_idx][d] -= ex.amount
+            self._override_fires += 1
+        return tuple(self._actual[layer_idx])
+
+    def record_routing(self, layer_idx: int, position: int, experts: Sequence[int], weights: Sequence[float],
+                       *, router_logits: Sequence[float] | None = None, hidden_state_norm: float | None = None) -> None:
+        if (not self.enabled or layer_idx not in self.monitored_layers
+                or (self.monitored_positions and position not in self.monitored_positions)):
+            return
+        if len(experts) != len(weights):
+            raise ValueError("selected experts and weights differ in length")
+        k = self._actual[layer_idx][position]
+        if len(experts) != k:
+            raise ValueError("recorded selected experts do not match actual K")
+        record = {
+            "module": self.module_names[layer_idx],
+            "k": k,
+            "experts": tuple(int(e) for e in experts),
+            "weights": tuple(float(w) for w in weights),
+            "hidden_state_norm": None if hidden_state_norm is None else float(hidden_state_norm),
+        }
+        if router_logits is not None:
+            from .features import router_statistics
+            record["router_statistics"] = router_statistics(router_logits, k, selected_experts=experts)
+        self._route_records[(layer_idx, position)] = record
+
+    def record_layer_pairs(self, layer_idx: int, module_name: str, pair_count: int) -> None:
+        if not self.enabled or not 0 <= layer_idx < len(self.module_names):
+            raise RuntimeError("cannot record pair count outside an active forward")
+        if module_name != self.module_names[layer_idx] or self._calls[layer_idx] != 1:
+            raise RuntimeError("pair count recorded for the wrong layer/module")
+        if self._observed_layer_pairs[layer_idx] is not None:
+            raise RuntimeError("layer pair count recorded more than once")
+        if pair_count < 0:
+            raise ValueError("pair count cannot be negative")
+        self._observed_layer_pairs[layer_idx] = int(pair_count)
+
+    def end_forward(self) -> dict:
+        if not self.enabled or self._plan is None:
+            raise RuntimeError("no open controller forward")
+        missing = [i for i, n in enumerate(self._calls) if n != 1 or self._observed_layer_pairs[i] is None]
+        if missing:
+            self.enabled = False
+            raise RuntimeError(f"expected one call and one observed pair count per MoE layer; invalid layers={missing}")
+        for i, row in enumerate(self._plan):
+            if self._observed_layer_pairs[i] != sum(self._actual[i]):
+                self.enabled = False
+                raise RuntimeError(f"observed expert-token pairs disagree with actual K plan at layer {i}")
+        ex = self._exchange
+        should_fire = bool(self._branch == "treatment" and ex and ex.global_nfe == self._global_nfe)
+        if self._override_fires != int(should_fire):
+            self.enabled = False
+            raise RuntimeError(f"override fired {self._override_fires} times; expected {int(should_fire)}")
+        if ex and ex.global_nfe == self._global_nfe:
+            before = sum(self._plan[ex.layer_idx])
+            after = sum(self._actual[ex.layer_idx])
+            if before != after:
+                self.enabled = False
+                raise RuntimeError("budget-neutral exchange changed target-layer budget")
+            changed = [i for i, (a, b) in enumerate(zip(self._plan[ex.layer_idx], self._actual[ex.layer_idx])) if a != b]
+            if self._branch == "treatment" and set(changed) != {ex.recipient_position, ex.donor_position}:
+                self.enabled = False
+                raise RuntimeError("exchange changed positions outside recipient and donor")
+        result = {
+            "global_nfe": self._global_nfe,
+            "branch": self._branch,
+            "module_names": self.module_names,
+            "k_by_layer": tuple(tuple(row) for row in self._actual),
+            "layer_pair_counts": tuple(int(n) for n in self._observed_layer_pairs),
+            "direct_pairs": sum(int(n) for n in self._observed_layer_pairs),
+            "override_fires": self._override_fires,
+            "routing_records": dict(self._route_records),
+        }
+        self.enabled = False
+        self._plan = None
+        return result
+
+    def abort_forward(self) -> None:
+        """Release per-forward state after OOM, Ctrl+C, or a model exception."""
+        self.enabled = False
+        self._plan = None
+        self._actual = []
+        self._calls = []
+        self._observed_layer_pairs = []
+        self._route_records = {}

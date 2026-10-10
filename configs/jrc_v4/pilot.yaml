@@ -1,0 +1,74 @@
+protocol_version: jrc-moe-v4-intervention-1
+model:
+  id: inclusionAI/LLaDA-MoE-7B-A1B-Instruct
+  revision: 783d3467f108d28ac0a78d3e41af16ab05cabd8d
+  num_layers: 16
+  num_experts: 64
+  native_top_k: 8
+  dtype: float16
+dataset:
+  name: gsm8k
+  historical_fixed8_csv: data/diagnostic_50_results.csv
+  few_shot: 5
+  few_shot_seed: 1234
+  prompt_partition_seed: 20261009
+  prompt_partition: development_only
+  confirmatory_prompt_ids: []
+decoder:
+  generation_length: 256
+  block_length: 32
+  confidence_threshold: 0.90
+  commit_policy: threshold_with_argmax_fallback
+  continuation_policy: fixed8
+  batch_size: 1
+intervention:
+  min_k: 2
+  max_k: 8
+  legal_k: [2, 4, 6, 8]
+  operational_base_k: 6
+  recipient_k: 7
+  donor_k: 5
+  monitored_layers: [4, 12]
+  eligible_positions: unresolved_tokens_only
+  preserve_other_layer_and_position_allocations: true
+  require_budget_neutral_target_layer: true
+  require_full_rollout: true
+randomness:
+  kind: indexed_by_prompt_stream_step_block_position_purpose
+  deterministic_decoder_expected: true
+  verify_before_claiming_determinism: true
+features:
+  attention_enabled: false
+  attention_disable_reason: post_qk_norm_post_rope_hook_and_short_sequence_fidelity_not_yet_verified
+  heads: [0, 4, 8, 12]
+  positional_landmarks: 16
+  candidate_neighbor_cap: 8
+  temporal_history_window: 4
+  graph_refresh_every: 2
+sampling:
+  target_prompts: 50
+  states_per_prompt: 1
+  exchanges_per_state: 2
+  coupled_streams: 1
+  arms_per_exchange: 2
+  tier2_random_probability_sample: true
+  keep_zero_effects: true
+statistics:
+  bootstrap_unit: prompt
+  bootstrap_resamples: 2000
+  bootstrap_seed: 20261009
+gates:
+  g0: blocked_until_runtime_audit_native_patch_fidelity_and_replay_pass
+  g1: require_held_out_joint_signal_gain_over_strong_controls
+  g2: require_community_gain_over_capacity_matched_ungrouped_joint
+  g3: require_matched_executed_pair_final_utility_gain
+  g4: require_measured_end_to_end_wall_clock_frontier_gain
+resources:
+  gpu_count: 1
+  max_gpu_hours: 24
+  max_branches: 200
+  max_prompts: 50
+  max_wall_hours: 30
+  max_output_gb: 10
+  output_root: outputs/jrc_v4
+resume: true

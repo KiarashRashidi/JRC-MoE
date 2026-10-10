@@ -1,9 +1,15 @@
 """Command-line entry point."""
 import argparse
-from .runner import run_experiment
+import sys
 
 
 def main():
+    # Keep the published REFLEX command/parser exactly as before; dispatch the
+    # new experimental namespace only when explicitly requested.
+    if len(sys.argv) > 1 and sys.argv[1] == "jrc-v4":
+        from .jrc_v4.cli import main as v4_main
+        return v4_main(sys.argv[2:])
+    from .runner import run_experiment
     parser = argparse.ArgumentParser(prog="jrc-moe")
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="run or resume the paper-faithful 50-prompt replication")

@@ -1,0 +1,57 @@
+status: draft_pending_development_pilot
+protocol: jrc-moe-v4-intervention-1
+checkpoint:
+  model_id: inclusionAI/LLaDA-MoE-7B-A1B-Instruct
+  revision: 783d3467f108d28ac0a78d3e41af16ab05cabd8d
+population:
+  source: GSM8K development prompts
+  confirmatory_prompts_locked: true
+  prompt_is_independence_unit: true
+  split_seed: 20261009
+intervention:
+  K_bounds: [2, 8]
+  operational_base_K: 6
+  exchange: recipient_6_to_7_and_donor_6_to_5
+  target_layer_forward_pairs_must_match: true
+  continuation_policy: fixed8
+  full_rollout_required: true
+  utility: frozen_canonical_gsm8k_correctness_0_or_1
+  retain_effects: [-1, 0, 1]
+primary_endpoint:
+  name: prompt_averaged_gain_from_recommended_budget_neutral_exchanges
+  comparator: validation_selected_strongest_noncommunity_model
+  minimum_meaningful_gain: null
+  rationale: Set from pilot variance and scientific judgement before confirmatory access.
+secondary_endpoints:
+  - within_state_Kendall_tau_b_with_ties
+  - selected_exchange_decision_gain
+  - coverage_and_zero_positive_negative_frequencies
+  - tier1_to_tier2_rank_sign_and_calibration
+inference:
+  prompt_clustered_bootstrap_resamples: 2000
+  seed: 20261009
+  multiplicity_correction: null
+  confirmatory_sample_size: null
+models:
+  - token_only_reflex_entropy_margin_gate_mass_position_hidden_controls
+  - attention_only
+  - router_history_only
+  - capacity_matched_ungrouped_joint_four_channel
+  - community_conditioned_only_if_G1_passes
+selection:
+  include_uniform_random_probability_sample: true
+  preserve_zero_outcomes: true
+  tune_on_development_only: true
+resource_limits:
+  max_gpu_hours: 24
+  max_branches: 200
+  max_prompts: 50
+  max_wall_hours: 30
+  max_output_gb: 10
+  gpu_count: 1
+gates:
+  G0: blocked_until_checkpoint_routing_replay_and_profile_are_verified
+  G1: require_held_out_intervention_gain_over_strong_controls
+  G2: require_equal_capacity_community_gain_net_of_overhead
+  G3: require_final_utility_gain_at_matched_total_executed_pairs
+  G4: require_end_to_end_measured_latency_frontier_gain
