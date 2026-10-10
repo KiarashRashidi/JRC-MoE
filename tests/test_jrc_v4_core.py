@@ -1,4 +1,5 @@
 import random
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from jrc_moe.jrc_v4.communities import (EmpiricalCalibrator, PastOnlyCommunities
 from jrc_moe.jrc_v4.controller import BudgetExchange, LayerwiseKController
 from jrc_moe.jrc_v4.features import (FeatureRecord, affinity_channels, positional_landmarks,
                                      post_rope_landmark_scores, router_statistics)
-from jrc_moe.jrc_v4.io import BudgetExhausted, BudgetLedger
+from jrc_moe.jrc_v4.io import BudgetExhausted, BudgetLedger, atomic_write_json, bind_run_identity
 from jrc_moe.jrc_v4.replay import RNGSnapshot, capture_replay_state
 from jrc_moe.jrc_v4.sampling import IndexedRandom, prompt_split_manifest, sample_equal_budget_exchanges
 from jrc_moe.jrc_v4.settings import ResourceCaps
@@ -152,6 +153,15 @@ class ReplayAndSamplingTests(unittest.TestCase):
         clone.confidence_history[2].append(0.9)
         self.assertEqual(state.input_ids[0][0], 1)
         self.assertEqual(state.confidence_history[2], [0.5])
+        selected = state.clone()
+        selected.selected_layer_idx = 0
+        selected.recipient_position = 1
+        selected.donor_position = 2
+        self.assertIsNone(state.selected_layer_idx)
+        self.assertEqual(selected.recipient_position, 1)
+        with self.assertRaises(ValueError):
+            selected.donor_position = 1
+            selected.__post_init__()
 
     def test_indexed_stream_and_prompt_split_do_not_depend_on_order(self):
         rng = IndexedRandom(9)
@@ -170,6 +180,18 @@ class ReplayAndSamplingTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(row["recipient_k_after"] == 7 and row["donor_k_after"] == 5 for row in rows))
         self.assertTrue(all(row["selection_probability"] == 2 / 6 for row in rows))
+
+    def test_replay_selected_site_must_match_exchange(self):
+        from jrc_moe.jrc_v4.interventions import paired_exchange_rollout
+        state = self._state()
+        state.selected_layer_idx = 0
+        state.recipient_position = 1
+        state.donor_position = 2
+        with self.assertRaises(ValueError):
+            paired_exchange_rollout(model=None, prompt_ids=None, mode="test",
+                                    controller=LayerwiseKController(("layer.0",)), state=state,
+                                    exchange=BudgetExchange(1, 0, 1, 0), allocation_provider=lambda **kw: [],
+                                    utility=lambda _: 0, checkpoint_revision="rev", config_digest="digest")
 
 
 class StatisticsAndPolicyTests(unittest.TestCase):
@@ -208,6 +230,46 @@ class StatisticsAndPolicyTests(unittest.TestCase):
         self.assertEqual(alloc["allocation"], {0: 3, 1: 3})
         self.assertTrue(alloc["surrogate_assumptions"]["nonincreasing_marginals"])
 
+    def test_pilot_analysis_is_prompt_disjoint_and_blocks_missing_attention(self):
+        from jrc_moe.jrc_v4.analysis import run_pilot_analysis
+        root = Path.cwd() / "outputs" / "jrc_v4" / "test_analysis"
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root) as tmp:
+            pilot = Path(tmp) / "pilot"
+            output = Path(tmp) / "analysis"
+            pilot.mkdir()
+            (pilot / "manifest.json").write_text(json.dumps({"status": "passed", "g0": "passed"}), encoding="utf-8")
+            split = {"development": ["a", "b", "c", "d"], "validation": ["e", "f"],
+                     "confirmatory": [], "sha256": "split-hash"}
+            (pilot / "dataset_split_manifest.json").write_text(json.dumps(split), encoding="utf-8")
+            features, outcomes = [], []
+            for prompt_idx, prompt_id in enumerate(("a", "b", "c", "d", "e", "f")):
+                for exchange_idx, effect in enumerate((-1, 0, 1)):
+                    exchange_id = f"{prompt_id}-{exchange_idx}"
+                    outcomes.append({"exchange_id": exchange_id, "prompt_id": prompt_id,
+                                     "effect": effect, "layer_idx": 4,
+                                     "control_correct": int(effect < 0), "treatment_correct": int(effect > 0)})
+                    for role, position in (("recipient", 50 + exchange_idx), ("donor", 80 + exchange_idx)):
+                        features.append({"prompt_id": prompt_id, "global_nfe": 1 + exchange_idx,
+                                         "layer_idx": 4, "position": position, "block_idx": 0,
+                                         "mask_ratio": 1.0, "is_target_token": True, "active_block": True,
+                                         "relative_position": position / 256, "unresolved": True,
+                                         "confidence_history": [0.2 + prompt_idx * 0.01, 0.3 + exchange_idx * 0.02],
+                                         "hidden_state_norm": 1.0 + position / 100,
+                                         "router": {"router_entropy": 1.0 + exchange_idx,
+                                                    "top_k_gate_mass": 0.5 + exchange_idx * 0.05,
+                                                    "admission_margin": 0.1 + exchange_idx * 0.01,
+                                                    "next_expert_gate": 0.02 + exchange_idx * 0.01,
+                                                    "selected_k": 6},
+                                         "extra": {"exchange_id": exchange_id, "role": role}})
+            (pilot / "features.jsonl").write_text("".join(json.dumps(row) + "\n" for row in features), encoding="utf-8")
+            (pilot / "paired_exchange_records.jsonl").write_text("".join(json.dumps(row) + "\n" for row in outcomes), encoding="utf-8")
+            report = run_pilot_analysis(pilot_dir=pilot, output_dir=output, seed=5, bootstrap_resamples=100)
+            self.assertEqual(report["g1"], "blocked_missing_verified_attention_features")
+            self.assertEqual(report["rows"], {"all_complete": 18, "train": 12, "validation": 6})
+            self.assertEqual(report["split"]["confirmatory_prompts"], 0)
+            self.assertTrue((output / "predictions.csv").is_file())
+
     def test_communities_are_past_only_chronological_and_bounded(self):
         first = PastOnlyCommunities(4, neighbor_cap=2, max_group_size=3, passes=2, history_window=2)
         second = PastOnlyCommunities(4, neighbor_cap=2, max_group_size=3, passes=2, history_window=2)
@@ -232,6 +294,9 @@ class ResourceSafetyTests(unittest.TestCase):
             caps = ResourceCaps(max_gpu_hours=1, max_branches=1, max_prompts=1,
                                 max_wall_hours=1, max_output_gb=1)
             ledger = BudgetLedger(caps, Path(tmp))
+            ledger.check_before_branch("p1", count_branch=False)
+            self.assertEqual(ledger.branches_started, 0)
+            self.assertEqual(ledger.prompts_started, {"p1"})
             ledger.check_before_branch("p1")
             ledger.add_gpu_time(10.0)
             resumed = BudgetLedger.resume_from(caps, tmp)
@@ -250,6 +315,43 @@ class ResourceSafetyTests(unittest.TestCase):
         with self.assertRaises(BudgetExhausted):
             ledger.check_before_branch("p1", reserve_gpu_seconds=3601)
         self.assertEqual(ledger.branches_started, 0)
+
+    def test_resume_identity_allows_clean_initialization_and_rejects_mismatched_or_unbound_data(self):
+        root_dir = Path.cwd() / "outputs" / "jrc_v4" / "test_resume_identity"
+        root_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root_dir) as tmp:
+            root = Path(tmp)
+            identity = {"commit": "abc", "caps": {"branches": 12}}
+            progress = bind_run_identity(root, identity, resume=True)
+            self.assertEqual(progress, root / "progress.json")
+            self.assertFalse(progress.exists())
+            atomic_write_json(progress, {"branches_started": 0})
+            bind_run_identity(root, identity, resume=True)
+            with self.assertRaises(RuntimeError):
+                bind_run_identity(root, {**identity, "commit": "different"}, resume=True)
+
+        with tempfile.TemporaryDirectory(dir=root_dir) as tmp:
+            root = Path(tmp)
+            atomic_write_json(root / "progress.json", {"branches_started": 1})
+            with self.assertRaises(RuntimeError):
+                bind_run_identity(root, {"commit": "abc"}, resume=True)
+
+
+class StageSequenceTests(unittest.TestCase):
+    def test_stage1_requires_a_smoke_from_same_config_commit_and_audit(self):
+        from jrc_moe.jrc_v4.cli import _smoke_stage_blocker
+        audit = {"git_commit": "commit-a"}
+        smoke = {"stage": "smoke", "status": "passed", "g0": "passed",
+                 "config_sha256": "config-a", "git_commit": "commit-a",
+                 "audit_manifest_sha256": "audit-a"}
+        self.assertIsNone(_smoke_stage_blocker(smoke, audit, "config-a", "audit-a"))
+        self.assertIn("smoke stage", _smoke_stage_blocker(None, audit, "config-a", "audit-a"))
+        self.assertIn("different configuration",
+                      _smoke_stage_blocker(smoke, audit, "config-b", "audit-a"))
+        self.assertIn("different source commit",
+                      _smoke_stage_blocker({**smoke, "git_commit": "commit-b"}, audit, "config-a", "audit-a"))
+        self.assertIn("different G0 audit",
+                      _smoke_stage_blocker(smoke, audit, "config-a", "audit-b"))
 
 
 if __name__ == "__main__":

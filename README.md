@@ -39,10 +39,10 @@ The new `jrc-moe jrc-v4` namespace keeps the REFLEX replication path separate. B
 jrc-moe jrc-v4 audit --config configs/jrc_v4/pilot.yaml --output-dir outputs/jrc_v4/audit
 python -m unittest discover -s tests -p 'test_jrc_v4_*.py' -v
 jrc-moe jrc-v4 smoke --config configs/jrc_v4/pilot.yaml --max-prompts 3 --max-branches 12 --output-dir outputs/jrc_v4/smoke
-jrc-moe jrc-v4 pilot --config configs/jrc_v4/pilot.yaml --max-prompts 50 --max-branches 200 --max-gpu-hours 24 --resume --output-dir outputs/jrc_v4/pilot
+jrc-moe jrc-v4 pilot --config configs/jrc_v4/pilot.yaml --max-prompts 50 --max-branches 200 --max-gpu-hours 24 --max-wall-hours 30 --max-output-gb 10 --resume --output-dir outputs/jrc_v4/pilot
 ```
 
-All new-run commands accept `--max-gpu-hours`, `--max-branches`, `--max-prompts`, `--max-wall-hours`, `--max-output-gb`, and `--resume`. See [docs/jrc_v4/runbook.md](docs/jrc_v4/runbook.md) for stage gates and artifact handling. Community, allocation, and systems stages remain conditional on earlier measured evidence.
+Run `audit`, then the bounded `smoke`, before Stage 1 `pilot`; pilot checks that the smoke used the same config, source commit, and audit manifest. The first pilot invocation may use `--resume` with an empty output directory; later invocations must match its recorded run identity and caps. See [docs/jrc_v4/runbook.md](docs/jrc_v4/runbook.md) for artifact handling. Community, allocation, and systems stages remain conditional on earlier measured evidence.
 
 ## Git workflow
 

@@ -14,8 +14,10 @@ class CheckpointFidelityTests(unittest.TestCase):
         from jrc_moe.config import GEN_LENGTH, MASK_ID, MODEL_REVISION
         from jrc_moe.model import input_device, load_model
         from jrc_moe.jrc_v4.fidelity import native_patch_fidelity, verified_contract_from_loaded_model
-        from jrc_moe.jrc_v4.controller import LayerwiseKController
+        from jrc_moe.jrc_v4.controller import BudgetExchange, LayerwiseKController
         from jrc_moe.jrc_v4.patch import install_layerwise_patch
+        from jrc_moe.jrc_v4.replay import ReplayState
+        import jrc_moe.generation as generation
 
         model, tokenizer = load_model()
         encoded = tokenizer("Solve 1 + 1.", return_tensors="pt")["input_ids"].to(input_device(model))
@@ -55,6 +57,61 @@ class CheckpointFidelityTests(unittest.TestCase):
                 info = controller.end_forward()
                 self.assertEqual(info["layer_pair_counts"], (k * x.shape[1],) * len(names))
         finally:
+            for _, module in model.named_modules():
+                if hasattr(module, "_jrc_v4_original_forward"):
+                    module.forward = module._jrc_v4_original_forward
+
+        # Exercise full replay and branch-order invariance with one 32-token
+        # block to keep this opt-in integration check bounded.
+        old_length, old_blocks = generation.GEN_LENGTH, generation.NUM_BLOCKS
+        generation.GEN_LENGTH, generation.NUM_BLOCKS = 32, 1
+        total = prompt_len + 32
+        replay_controller = LayerwiseKController(names, min_k=2, max_k=8)
+        install_layerwise_patch(model, replay_controller, verified)
+        base_provider = lambda **kw: [[6] * total for _ in names]
+        fast_provider = lambda **kw: [[8] * total for _ in names]
+        state_box = {}
+        def capture_first(state):
+            state_box["state"] = state.clone()
+            return True
+        try:
+            _, _, paused = generation.generate_with_routing_mode(
+                model, encoded, "jrc_v4_test", replay_controller,
+                allocation_provider=base_provider,
+                before_forward=capture_first,
+                before_forward_nfe=1, checkpoint_revision=MODEL_REVISION,
+                config_digest="gpu-integration-test")
+            self.assertTrue(paused.get("paused_before_forward"))
+            state = state_box["state"]
+            exchange = BudgetExchange(1, 0, prompt_len, prompt_len + 1, 1)
+            state.selected_layer_idx = 0
+            state.recipient_position = prompt_len
+            state.donor_position = prompt_len + 1
+
+            def run_order(order):
+                seen = {}
+                for branch in order:
+                    seen[branch] = generation.generate_with_routing_mode(
+                        model, encoded, "jrc_v4_test", replay_controller,
+                        allocation_provider=fast_provider, resume_state=state.clone(),
+                        branch=branch, exchange=exchange, checkpoint_revision=MODEL_REVISION,
+                        config_digest="gpu-integration-test")
+                return seen
+
+            ab = run_order(("control", "treatment"))
+            ba = run_order(("treatment", "control"))
+            for branch in ("control", "treatment"):
+                self.assertTrue(torch.equal(ab[branch][0], ba[branch][0]))
+                self.assertTrue(ab[branch][1].drop(columns=["forward_seconds"], errors="ignore").equals(
+                    ba[branch][1].drop(columns=["forward_seconds"], errors="ignore")))
+                self.assertEqual(ab[branch][2]["total_nfe"], ba[branch][2]["total_nfe"])
+                self.assertEqual(ab[branch][2]["total_pairs"], ba[branch][2]["total_pairs"])
+            def target_layer_pairs(trace):
+                row = trace[trace["global_nfe"] == 1].iloc[0]
+                return int(row["layer_budgets"][0])
+            self.assertEqual(target_layer_pairs(ab["control"][1]), target_layer_pairs(ab["treatment"][1]))
+        finally:
+            generation.GEN_LENGTH, generation.NUM_BLOCKS = old_length, old_blocks
             for _, module in model.named_modules():
                 if hasattr(module, "_jrc_v4_original_forward"):
                     module.forward = module._jrc_v4_original_forward

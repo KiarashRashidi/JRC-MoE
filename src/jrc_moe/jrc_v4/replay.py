@@ -64,6 +64,9 @@ class ReplayState:
     config_digest: str
     rng: RNGSnapshot = field(default_factory=RNGSnapshot.capture)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    selected_layer_idx: int | None = None
+    recipient_position: int | None = None
+    donor_position: int | None = None
 
     def __post_init__(self) -> None:
         if self.global_nfe < 1 or self.local_nfe < 1 or self.block_idx < 0:
@@ -72,6 +75,16 @@ class ReplayState:
             raise ValueError("replay requires checkpoint revision and resolved-config digest")
         if self.commit_policy not in {"threshold_with_argmax_fallback"}:
             raise ValueError("unsupported commit policy")
+        selected = (self.selected_layer_idx, self.recipient_position, self.donor_position)
+        if any(value is not None for value in selected):
+            if any(value is None for value in selected):
+                raise ValueError("selected layer, recipient, and donor must be recorded together")
+            if self.recipient_position == self.donor_position:
+                raise ValueError("replay recipient and donor must differ")
+            if not (0 <= self.selected_layer_idx < len(self.k_by_layer)
+                    and 0 <= self.recipient_position < len(self.k_by_layer[0])
+                    and 0 <= self.donor_position < len(self.k_by_layer[0])):
+                raise ValueError("replay intervention identity is out of range")
 
     def clone(self) -> "ReplayState":
         """Copy tensors and mutable histories so branch order cannot contaminate state."""

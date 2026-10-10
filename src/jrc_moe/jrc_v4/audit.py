@@ -52,7 +52,8 @@ def collect_environment(repo_root: str | Path) -> dict:
         # Record only non-secret configuration knobs; never serialize HF_TOKEN or credentials.
         "cuda_environment": {k: os.environ.get(k) for k in (
             "CUDA_VISIBLE_DEVICES", "CUDA_HOME", "CUDA_PATH", "PYTORCH_CUDA_ALLOC_CONF",
-            "HF_HOME", "HF_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_HUB_OFFLINE", "VIRTUAL_ENV")
+            "HF_HOME", "HF_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_HUB_OFFLINE",
+            "HF_DATASETS_CACHE", "HF_DATASETS_OFFLINE", "JRC_MOE_GSM8K_DIR", "VIRTUAL_ENV")
             if os.environ.get(k) is not None},
         "nvidia_smi": _run(["nvidia-smi"]),
         "nvidia_query": _run(["nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total,memory.free,memory.used,utilization.gpu", "--format=csv"]),

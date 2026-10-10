@@ -68,6 +68,9 @@ def generate_with_routing_mode(
     checkpoint_revision=None,
     config_digest=None,
     sampler_settings=None,
+    before_forward_nfe=None,
+    forward_observer=None,
+    sensitivity_observer=None,
 ):
     prompt_ids = prompt_ids.to(resolve_input_device(model))
 
@@ -169,7 +172,8 @@ def generate_with_routing_mode(
                 controller.begin_forward(k_counts)
 
             try:
-                if before_forward is not None and not restored_this_forward:
+                if (before_forward is not None and not restored_this_forward
+                        and (before_forward_nfe is None or global_nfe == before_forward_nfe)):
                     from .jrc_v4.replay import capture_replay_state
                     k_matrix = k_counts
                     if len(k_counts) > 0 and isinstance(k_counts[0], (int, float)):
@@ -192,7 +196,18 @@ def generate_with_routing_mode(
                                   "prefix_seconds": time.perf_counter() - run_start,
                                   "mode": mode, "prompt_length": prompt_len},
                     )
-                    before_forward(state)
+                    pause = before_forward(state)
+                    if pause:
+                        if isinstance(controller, LayerwiseKController):
+                            controller.abort_forward()
+                        elapsed = float(time.perf_counter() - run_start)
+                        return x, pd.DataFrame(trace), {
+                            "mode": mode, "prompt_length": prompt_len, "sequence_length": total_len,
+                            "total_nfe": global_nfe, "total_pairs": int(total_pairs),
+                            "paused_before_forward": True, "global_nfe": global_nfe,
+                            "block_idx": block_idx, "continuation_seconds": elapsed,
+                            "shared_prefix_seconds": prefix_seconds,
+                        }
 
                 synchronized_timing = allocation_provider is not None or restored_this_forward
                 if synchronized_timing and torch.cuda.is_available():
@@ -210,6 +225,25 @@ def generate_with_routing_mode(
             pair_meta = controller.end_forward()
             direct_pairs = int(pair_meta["direct_pairs"])
             total_pairs += direct_pairs
+
+            # Router features are pre-admission records from the patched block;
+            # post-forward logits are exposed through a separate sensitivity hook
+            # and must never be fed into a pre-decision FeatureRecord.
+            if forward_observer is not None:
+                forward_observer({
+                    "branch": branch, "global_nfe": global_nfe, "block_idx": block_idx,
+                    "unresolved_positions": tuple(unresolved_abs),
+                    "masked_before": masked_before,
+                    "confidence_history": copy.deepcopy(confidence_history),
+                    "k_by_layer": pair_meta["k_by_layer"],
+                    "routing_records": pair_meta["routing_records"],
+                })
+            if sensitivity_observer is not None:
+                active_logits = outputs.logits[0, unresolved_abs, :]
+                sensitivity_observer({
+                    "branch": branch, "global_nfe": global_nfe, "block_idx": block_idx,
+                    "positions": tuple(unresolved_abs), "logits": active_logits,
+                })
 
             target_pred, target_conf = (
                 extract_target_predictions_and_confidence(

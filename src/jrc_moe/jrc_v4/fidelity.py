@@ -179,6 +179,7 @@ def native_patch_fidelity(model, controller_factory, contract: VerifiedMoEContra
             route_diff_max = 0.0
             rank_matches = 0
             rank_total = 0
+            expert_counts = [[0] * contract.num_experts for _ in blocks]
             for layer_idx, (_, module) in enumerate(blocks):
                 hidden = native_inputs[layer_idx].reshape(-1, native_inputs[layer_idx].shape[-1])
                 logits = module.gate(hidden)
@@ -190,6 +191,8 @@ def native_patch_fidelity(model, controller_factory, contract: VerifiedMoEContra
                         continue
                     expected_ids = experts[position].detach().cpu().tolist()
                     expected_weights = weights[position].to(hidden.dtype).float().detach().cpu().tolist()
+                    for expert in got["experts"]:
+                        expert_counts[layer_idx][int(expert)] += 1
                     rank_matches += int(tuple(expected_ids) == got["experts"])
                     rank_total += 1
                     if expected_weights:
@@ -201,6 +204,13 @@ def native_patch_fidelity(model, controller_factory, contract: VerifiedMoEContra
                            "selected_rank_match_fraction": rank_matches / rank_total if rank_total else None,
                            "selected_weight_max_abs_diff": route_diff_max,
                            "per_layer_executed_pairs": list(pair_meta["layer_pair_counts"]),
+                           "per_layer_expert_token_pairs": expert_counts,
+                           "active_experts_by_layer": [sum(count > 0 for count in row) for row in expert_counts],
+                           "load_balance_cv_by_layer": [
+                               float(torch.tensor(row, dtype=torch.float64).std(unbiased=False)
+                                     / torch.tensor(row, dtype=torch.float64).mean())
+                               if sum(row) else None for row in expert_counts],
+                           "nonempty_expert_calls_by_layer": [sum(count > 0 for count in row) for row in expert_counts],
                            "direct_pairs": pair_meta["direct_pairs"]}
             results.append(case_result)
             del native, patched, native_inputs, native_blocks, patch_blocks

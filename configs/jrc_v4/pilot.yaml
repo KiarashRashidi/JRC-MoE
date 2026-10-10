@@ -48,6 +48,7 @@ features:
 sampling:
   target_prompts: 50
   states_per_prompt: 1
+  target_nfe_range: [1, 8]
   exchanges_per_state: 2
   coupled_streams: 1
   arms_per_exchange: 2
@@ -70,5 +71,8 @@ resources:
   max_prompts: 50
   max_wall_hours: 30
   max_output_gb: 10
+  branch_reserve_gpu_seconds: 600
+  state_capture_reserve_gpu_seconds: 300
+  output_reserve_bytes: 65536
   output_root: outputs/jrc_v4
 resume: true

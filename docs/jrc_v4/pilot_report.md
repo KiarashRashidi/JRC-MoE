@@ -17,4 +17,4 @@ The local repository contains the historical `data/diagnostic_50_results.csv` (5
 
 This is an execution blocker report, not a negative scientific result.
 
-The CLI has not been run against the server. Local verification was limited to 17 passing CPU synthetic tests, one skipped model integration test, compilation, and CLI help. The current audit/stage runners are deliberately fail-closed but still need their runtime checks and branch execution adapter connected before a successful audit can authorize work.
+The CLI has not been run against the server. Local verification was limited to 21 passing CPU synthetic tests, one skipped model integration test, compilation, and CLI help. The audit and smoke/pilot runners are wired, but remain unexecuted and unverified against the pinned checkpoint. The signal analyzer is ready to compare token and router controls, but cannot test the joint attention/router hypothesis until the attention hook passes its source and fidelity checks. Community/allocation/systems execution remains gated.

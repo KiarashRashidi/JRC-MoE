@@ -35,6 +35,34 @@ def atomic_write_json(path: str | Path, value: Any) -> None:
         raise
 
 
+def bind_run_identity(output_dir: str | Path, identity: dict, *, resume: bool) -> Path:
+    """Bind resumable output to its exact inputs and reject unsafe continuation."""
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    identity_path = root / "run_identity.json"
+    progress_path = root / "progress.json"
+    artifact_names = ("state_index.jsonl", "interventions.jsonl", "features.jsonl",
+                      "branch_outcomes.jsonl", "paired_exchange_records.jsonl", "failures.jsonl")
+    has_artifacts = any((root / name).is_file() for name in artifact_names)
+    cost_path = root / "cost_ledger.csv"
+    has_cost_rows = cost_path.is_file() and len(cost_path.read_text(encoding="utf-8").splitlines()) > 1
+    if identity_path.is_file():
+        if not resume:
+            raise RuntimeError("output directory already has a run identity; pass --resume or choose a new output directory")
+        previous_identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        if previous_identity != identity:
+            raise RuntimeError("resume run identity differs in code, config, checkpoint, data, audit, caps, or prompt limit")
+        if not progress_path.is_file() and (has_artifacts or has_cost_rows):
+            raise RuntimeError("cannot resume existing artifacts without their original progress.json")
+    elif resume:
+        if progress_path.is_file() or has_artifacts:
+            raise RuntimeError("cannot resume existing artifacts without their original run_identity.json")
+        if has_cost_rows:
+            raise RuntimeError("cannot resume a nonempty cost ledger without its original run_identity.json")
+    atomic_write_json(identity_path, identity)
+    return progress_path
+
+
 def append_jsonl(path: str | Path, value: Any) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -78,14 +106,20 @@ class BudgetLedger:
         return ledger
 
     def check_before_branch(self, prompt_id: str, *, reserve_gpu_seconds: float = 0.0,
-                            reserve_wall_seconds: float = 0.0, reserve_output_bytes: int = 0) -> None:
-        """Call before any model work for a new branch; failed attempts count."""
+                            reserve_wall_seconds: float = 0.0, reserve_output_bytes: int = 0,
+                            count_branch: bool = True) -> None:
+        """Reserve resources before a branch or shared-prefix setup work.
+
+        Prefix setup contributes GPU/wall time and prompt usage but is not a
+        counterfactual branch; set ``count_branch=False`` for that work.
+        Failed branch attempts still count when ``count_branch`` is true.
+        """
         self.caps.validate()
         wall_h = (time.monotonic() - self.started_at) / 3600.0
         next_prompts = len(self.prompts_started | {str(prompt_id)})
         output_gb = directory_size_bytes(self.output_dir) / (1024 ** 3)
         checks = (
-            (self.branches_started >= self.caps.max_branches, "max_branches"),
+            (count_branch and self.branches_started >= self.caps.max_branches, "max_branches"),
             (next_prompts > self.caps.max_prompts, "max_prompts"),
             (self.gpu_seconds + max(0.0, reserve_gpu_seconds) >= self.caps.max_gpu_hours * 3600, "max_gpu_hours"),
             (wall_h + max(0.0, reserve_wall_seconds) / 3600.0 >= self.caps.max_wall_hours, "max_wall_hours"),
@@ -96,7 +130,8 @@ class BudgetLedger:
                 self.stopped_reason = name
                 atomic_write_json(self.output_dir / "progress.json", self.snapshot())
                 raise BudgetExhausted(f"resource cap reached before next branch: {name}")
-        self.branches_started += 1
+        if count_branch:
+            self.branches_started += 1
         self.prompts_started.add(str(prompt_id))
         atomic_write_json(self.output_dir / "progress.json", self.snapshot())
 
