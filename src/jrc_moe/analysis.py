@@ -16,7 +16,7 @@ def summarize(results: pd.DataFrame, fixed8: pd.DataFrame, output_dir: Path) -> 
     }
     rows = [base]
     for mode in RUN_MODES:
-        part = results[results.mode == mode]
+        part = results[results["mode"] == mode]
         rows.append({
             "mode": mode, "n": int(len(part)),
             "correct": int(part.canonical_correct.sum()),
@@ -59,10 +59,10 @@ def summarize(results: pd.DataFrame, fixed8: pd.DataFrame, output_dir: Path) -> 
         ).reset_index()
         mechanism.to_csv(output_dir / "mechanism_summary.csv", index=False)
         for mode in ("fger_only", "reflex"):
-            part = traces[traces.mode == mode]
+            part = traces[traces["mode"] == mode]
             if not (part.fger_high_count == part.fger_low_count).all():
                 raise RuntimeError(f"{mode}: high/low FGER group conservation failed")
-        fger = traces[traces.mode == "fger_only"]
+        fger = traces[traces["mode"] == "fger_only"]
         if not (fger.forward_mean_k.sub(8.0).abs() <= 1e-12).all():
             raise RuntimeError("FGER-only did not preserve AvgK=8 at every forward")
 

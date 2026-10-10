@@ -1,5 +1,6 @@
 """Pinned LLaDA-MoE loading and the notebook's Fixed8 equivalence gate."""
 import gc
+import os
 import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
@@ -8,10 +9,15 @@ from .routing import VariableKController, install_variable_k_patch
 
 
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, revision=MODEL_REVISION, trust_remote_code=True)
+    local_files_only = os.environ.get("HF_HUB_OFFLINE", "").lower() in {"1", "true", "yes"}
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_ID, revision=MODEL_REVISION, trust_remote_code=True,
+        local_files_only=local_files_only,
+    )
     model = AutoModel.from_pretrained(
         MODEL_ID, revision=MODEL_REVISION, trust_remote_code=True,
         torch_dtype=torch.float16, device_map="auto", low_cpu_mem_usage=True,
+        local_files_only=local_files_only,
     ).eval()
     cfg = model.config
     checks = {

@@ -116,7 +116,7 @@ def run_experiment(fixed8_csv: str | Path, output_dir: str | Path, limit: int | 
 
     rows = list(completed.values())
     results = pd.DataFrame(rows)
-    results = results[results.test_idx.isin(indices) & results.mode.isin(RUN_MODES)]
+    results = results[results.test_idx.isin(indices) & results["mode"].isin(RUN_MODES)]
     results = results.drop_duplicates(["test_idx", "mode"], keep="last")
     if results.error.notna().any():
         raise RuntimeError("At least one run row records an error")
@@ -124,7 +124,7 @@ def run_experiment(fixed8_csv: str | Path, output_dir: str | Path, limit: int | 
         print(f"Partial progress: {len(results)}/150 paired results; summary gate is deferred.")
         return {"completed_rows": len(results), "expected_rows": 150, "partial": True}
     for mode in RUN_MODES:
-        if int((results.mode == mode).sum()) != 50:
+        if int((results["mode"] == mode).sum()) != 50:
             raise RuntimeError(f"{mode}: expected 50 rows")
     manifest = summarize(results, fixed8, output_dir)
     manifest["fixed8_patch_equivalence"] = equivalence

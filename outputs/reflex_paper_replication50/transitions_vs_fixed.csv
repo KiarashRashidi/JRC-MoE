@@ -1,0 +1,12 @@
+mode,transition_vs_fixed,count
+fger_only,C→C,38
+fger_only,C→W,1
+fger_only,W→C,4
+fger_only,W→W,7
+reflex,C→C,37
+reflex,C→W,2
+reflex,W→C,2
+reflex,W→W,9
+rrb_only,C→C,36
+rrb_only,C→W,3
+rrb_only,W→W,11

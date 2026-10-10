@@ -1,0 +1,94 @@
+{
+  "experiment": "REFLEX paper-faithful component replication on deterministic GSM8K-50",
+  "scope": "50-prompt mechanism reproduction; not full benchmark reproduction",
+  "model": {
+    "id": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
+    "revision": "783d3467f108d28ac0a78d3e41af16ab05cabd8d"
+  },
+  "modes": [
+    "rrb_only",
+    "fger_only",
+    "reflex"
+  ],
+  "paper_targets": [
+    {
+      "mode": "fixed8",
+      "paper_gsm8k_acc_pct": 76.5,
+      "paper_pairs_m": 32.2,
+      "paper_avgk_across_tasks": 8.0
+    },
+    {
+      "mode": "rrb_only",
+      "paper_gsm8k_acc_pct": 76.0,
+      "paper_pairs_m": 27.6,
+      "paper_avgk_across_tasks": 6.6
+    },
+    {
+      "mode": "fger_only",
+      "paper_gsm8k_acc_pct": 77.9,
+      "paper_pairs_m": 32.6,
+      "paper_avgk_across_tasks": 8.0
+    },
+    {
+      "mode": "reflex",
+      "paper_gsm8k_acc_pct": 76.4,
+      "paper_pairs_m": 27.7,
+      "paper_avgk_across_tasks": 6.6
+    }
+  ],
+  "summary": [
+    {
+      "mode": "fixed8",
+      "n": 50,
+      "correct": 39,
+      "accuracy": 0.78,
+      "mean_nfe": 92.88,
+      "mean_avg_k": 8.0,
+      "mean_pairs_m": 15.598976,
+      "total_pairs": 779948800
+    },
+    {
+      "mode": "rrb_only",
+      "n": 50,
+      "correct": 36,
+      "accuracy": 0.72,
+      "mean_nfe": 101.0,
+      "mean_avg_k": 6.539666163335611,
+      "mean_pairs_m": 13.68809728,
+      "total_pairs": 684404864
+    },
+    {
+      "mode": "fger_only",
+      "n": 50,
+      "correct": 42,
+      "accuracy": 0.84,
+      "mean_nfe": 93.46,
+      "mean_avg_k": 8.0,
+      "mean_pairs_m": 15.72938752,
+      "total_pairs": 786469376
+    },
+    {
+      "mode": "reflex",
+      "n": 50,
+      "correct": 39,
+      "accuracy": 0.78,
+      "mean_nfe": 103.6,
+      "mean_avg_k": 6.5734651595672675,
+      "mean_pairs_m": 14.093496320000002,
+      "total_pairs": 704674816
+    }
+  ],
+  "fixed8_patch_equivalence": {
+    "max_abs_logit_diff": 0.0,
+    "argmax_match_fraction": 1.0,
+    "max_confidence_diff": 0.0,
+    "direct_pairs": 170624,
+    "expected_pairs": 170624
+  },
+  "fixed8_input_sha256": "177942409f8dbf8ea0d54fe81c86c2021118a0d335d655adec6531410cb4cd26",
+  "grader": {
+    "version": "canonical_numeric_v1.0.2",
+    "sha256": "f3e3f5963c5d2b5b22d7b74c657fb1bc524dec7ab15aaa6e0b8e6e0e09926787",
+    "expected_sha256": "f3e3f5963c5d2b5b22d7b74c657fb1bc524dec7ab15aaa6e0b8e6e0e09926787"
+  }
+}
