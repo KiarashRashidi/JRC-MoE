@@ -337,6 +337,28 @@ class ResourceSafetyTests(unittest.TestCase):
                 bind_run_identity(root, {"commit": "abc"}, resume=True)
 
 
+class GpuTimingTests(unittest.TestCase):
+    def test_elapsed_cuda_time_uses_start_as_origin(self):
+        from unittest.mock import patch
+        from jrc_moe.jrc_v4.pilot import _gpu_seconds_since
+
+        class Event:
+            def __init__(self, name):
+                self.name = name
+
+            def record(self):
+                pass
+
+            def elapsed_time(self, other):
+                if (self.name, other.name) != ("start", "end"):
+                    raise AssertionError("CUDA elapsed time must be measured start to end")
+                return 125.0
+
+        with patch("jrc_moe.jrc_v4.pilot.torch.cuda.synchronize"):
+            seconds = _gpu_seconds_since(Event("start"), Event("end"), cuda=True)
+        self.assertAlmostEqual(seconds, 0.125)
+
+
 class StageSequenceTests(unittest.TestCase):
     def test_stage1_requires_a_smoke_from_same_config_commit_and_audit(self):
         from jrc_moe.jrc_v4.cli import _smoke_stage_blocker

@@ -68,7 +68,7 @@ def _gpu_seconds_since(start_event, end_event, cuda: bool) -> float:
     torch.cuda.synchronize()
     end_event.record()
     torch.cuda.synchronize()
-    return float(end_event.elapsed_time(start_event) / 1000.0)
+    return float(start_event.elapsed_time(end_event) / 1000.0)
 
 
 def _jsd(logp: torch.Tensor, logq: torch.Tensor) -> tuple[float, float]:
@@ -278,7 +278,7 @@ def run_pilot(*, root: Path, output_dir: Path, raw_config: dict, config_digest: 
                     torch.cuda.synchronize()
                     setup_end.record()
                     torch.cuda.synchronize()
-                    failed_gpu_seconds = setup_end.elapsed_time(setup_start) / 1000.0
+                    failed_gpu_seconds = setup_start.elapsed_time(setup_end) / 1000.0
                     ledger.add_gpu_time(failed_gpu_seconds)
                 else:
                     failed_gpu_seconds = 0.0

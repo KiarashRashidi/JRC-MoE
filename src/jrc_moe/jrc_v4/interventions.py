@@ -100,13 +100,13 @@ def paired_exchange_rollout(*, model, prompt_ids, mode: str, controller: Layerwi
                 torch.cuda.synchronize()
             if on_branch_error is not None:
                 on_branch_error(branch, exc, time.perf_counter() - started,
-                                end_event.elapsed_time(start_event) / 1000.0 if cuda else 0.0)
+                                start_event.elapsed_time(end_event) / 1000.0 if cuda else 0.0)
             raise
         if cuda:
             torch.cuda.synchronize()
             end_event.record()
             torch.cuda.synchronize()
-        gpu_seconds = end_event.elapsed_time(start_event) / 1000.0 if cuda else 0.0
+        gpu_seconds = start_event.elapsed_time(end_event) / 1000.0 if cuda else 0.0
         try:
             value = float(utility(output))
         except BaseException as exc:
