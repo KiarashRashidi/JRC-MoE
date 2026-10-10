@@ -18,7 +18,8 @@ from .settings import ResourceCaps, V4Settings
 
 STAGES = ("audit", "smoke", "pilot", "analyze", "preregister", "signal",
           "communities", "allocate", "systems", "report")
-DEFAULT_ROOTS = {"audit": "audit", "smoke": "smoke", "pilot": "pilot", "signal": "signal",
+DEFAULT_ROOTS = {"audit": "audit", "smoke": "smoke", "pilot": "pilot",
+                "analyze": "signal", "signal": "signal",
                 "communities": "community", "allocate": "allocator", "systems": "systems"}
 
 

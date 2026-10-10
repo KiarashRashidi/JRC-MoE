@@ -1,5 +1,8 @@
 import random
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -374,6 +377,25 @@ class StageSequenceTests(unittest.TestCase):
                       _smoke_stage_blocker({**smoke, "git_commit": "commit-b"}, audit, "config-a", "audit-a"))
         self.assertIn("different G0 audit",
                       _smoke_stage_blocker(smoke, audit, "config-a", "audit-b"))
+
+
+class CliBehaviorTests(unittest.TestCase):
+    def test_analyze_and_signal_share_the_canonical_gate_directory(self):
+        from jrc_moe.jrc_v4.cli import DEFAULT_ROOTS
+        self.assertEqual(DEFAULT_ROOTS["analyze"], DEFAULT_ROOTS["signal"])
+
+    def test_module_entrypoint_propagates_blocked_gate_status(self):
+        repository = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory(dir=repository) as temporary:
+            root = Path(temporary)
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(repository / "src")
+            result = subprocess.run(
+                [sys.executable, "-m", "jrc_moe.cli", "jrc-v4", "analyze",
+                 "--input-dir", str(root / "missing-pilot"),
+                 "--output-dir", str(root / "blocked-output")],
+                cwd=repository, env=environment, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

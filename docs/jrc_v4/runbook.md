@@ -26,4 +26,6 @@ python -m jrc_moe.cli jrc-v4 preregister --output-dir docs/jrc_v4/preregistratio
 
 `audit` records environment/cache/source fingerprints and must pass the pinned model, router, Fixed8, legal-K, and replay gates. `smoke` requires G0; Stage 1 `pilot` additionally requires a completed smoke from the same config, commit, and audit manifest. Both write blocker manifests and start no branches when prerequisites fail. `signal` requires pilot outcomes; `communities` additionally requires G1; `allocate` requires G1; `systems` requires G3; resource caps apply to every stage. `--resume` can initialize an empty output directory, then requires the same recorded run identity and caps for continuation while accumulating prior branch/GPU-time usage.
 
+`analyze` is an alias for `signal` and writes to the same canonical `outputs/jrc_v4/signal/` gate directory. A blocked scientific gate is recorded in its manifest and returns a nonzero process exit status.
+
 Never use the historical 50-prompt set for confirmatory claims. Do not enable attention claims until a verified post-QK-normalization/post-RoPE hook passes short-sequence fidelity. A per-forward budget-neutral exchange is not a full-trajectory matched-budget result.
