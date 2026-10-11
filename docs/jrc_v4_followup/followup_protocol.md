@@ -36,6 +36,8 @@ The campaign wrapper enforces a one-hour combined audit/smoke wall-time cap, a t
 
 From the clean follow-up worktree on `research-gpu`, after activating `/home/new_drive/rashidi/venvs/reflex-llada` and confirming the GPU is idle:
 
+The worktree needs the local GSM8K parquet mirror at `data/gsm8k/main/`; the runner exports `JRC_MOE_GSM8K_DIR` and records both source-file hashes. This keeps prompt reconstruction offline and reproducible.
+
 ```bash
 bash scripts/run_jrc_v4_followup_bounded.sh
 ```

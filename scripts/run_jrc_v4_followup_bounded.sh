@@ -30,6 +30,14 @@ fi
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
 export HF_HOME=/home/new_drive/rashidi/hf_cache
 export PYTHONPATH="$ROOT/src"
+export JRC_MOE_GSM8K_DIR="$ROOT/data/gsm8k"
+if [[ ! -f "$JRC_MOE_GSM8K_DIR/main/train-00000-of-00001.parquet" || \
+      ! -f "$JRC_MOE_GSM8K_DIR/main/test-00000-of-00001.parquet" ]]; then
+  echo "Expected the local GSM8K parquet mirror under $JRC_MOE_GSM8K_DIR/main" >&2
+  exit 2
+fi
+sha256sum "$JRC_MOE_GSM8K_DIR/main/train-00000-of-00001.parquet" \
+  "$JRC_MOE_GSM8K_DIR/main/test-00000-of-00001.parquet" >"$RUN_ROOT/gsm8k_mirror.sha256"
 
 run_timed() {
   local name="$1" limit="$2"
