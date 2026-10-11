@@ -59,7 +59,7 @@ remaining_initial=$((3600))
 run_timed audit "$remaining_initial" "$PYTHON" -m jrc_moe.cli jrc-v4 audit \
   --config "$CONFIG" --output-dir "$AUDIT_DIR" --max-gpu-hours 1 \
   --max-wall-hours 1 --max-branches 1 --max-prompts 1 --max-output-gb 2
-audit_seconds="$(awk -F '\t' '$1=="audit" {v=$2} END {print v+0}' "$RUN_ROOT/stage_wall_seconds.tsv")"
+audit_seconds="$(awk -F '\t' '$1=="audit" {v+=$2} END {print v+0}' "$RUN_ROOT/stage_wall_seconds.tsv")"
 remaining_initial=$((3600 - audit_seconds))
 if (( remaining_initial <= 0 )); then
   echo "Audit/smoke one-hour subcap exhausted by audit; smoke and pilot are blocked." >&2
@@ -71,7 +71,7 @@ fi
 run_timed smoke "$remaining_initial" "$PYTHON" -m jrc_moe.cli jrc-v4 smoke \
   --config "$CONFIG" --audit-dir "$AUDIT_DIR" --output-dir "$SMOKE_DIR" \
   --max-gpu-hours 0.75 --max-wall-hours 1 --max-branches 20 --max-prompts 1 --max-output-gb 1
-smoke_seconds="$(awk -F '\t' '$1=="smoke" {v=$2} END {print v+0}' "$RUN_ROOT/stage_wall_seconds.tsv")"
+smoke_seconds="$(awk -F '\t' '$1=="smoke" {v+=$2} END {print v+0}' "$RUN_ROOT/stage_wall_seconds.tsv")"
 if (( audit_seconds + smoke_seconds > 3600 )); then
   echo "Audit plus smoke exceeded the one-hour subcap; sensitivity is blocked." >&2
   exit 3
@@ -93,19 +93,22 @@ signal_rc=0
 run_timed signal 600 "$PYTHON" -m jrc_moe.cli jrc-v4 signal \
   --config "$CONFIG" --input-dir "$PILOT_DIR" --output-dir "$RUN_ROOT/signal" || signal_rc=$?
 
+"$PYTHON" scripts/analyze_jrc_v4_followup.py --input-dir "$PILOT_DIR" --output-dir "$RUN_ROOT/report"
+
 "$PYTHON" - "$RUN_ROOT" "$sensitivity_rc" "$attention_rc" "$signal_rc" <<'PY'
 import csv, json, pathlib, sys
+from jrc_moe.jrc_v4.resource_accounting import aggregate_stage_attempts
 root = pathlib.Path(sys.argv[1])
-stage_seconds = {}
+stage_rows = []
 with (root / "stage_wall_seconds.tsv").open() as stream:
     for name, seconds, status in csv.reader(stream, delimiter="\t"):
-        stage_seconds[name] = {"wall_seconds": int(seconds), "exit_code": int(status)}
+        stage_rows.append((name, int(seconds), int(status)))
+stage_seconds = aggregate_stage_attempts(stage_rows)
 branches = 0
 for name in ("smoke", "sensitivity"):
     path = root / name / "progress.json"
     if path.exists():
         branches += int(json.loads(path.read_text()).get("branches_started", 0))
-bytes_out = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 total_wall = sum(value["wall_seconds"] for value in stage_seconds.values())
 ledger = {
     "protocol": "jrc-v4-followup-d1-1",
@@ -113,7 +116,7 @@ ledger = {
     "total_wall_seconds": total_wall,
     "allocated_gpu_wall_hours_upper_bound": total_wall / 3600,
     "intervention_branches_started": branches,
-    "output_bytes": bytes_out,
+    "output_bytes": 0,
     "caps": {"total_wall_hours": 12, "total_branches": 400, "output_gb": 30,
              "audit_and_smoke_seconds": 3600, "sensitivity_seconds": 10800,
              "sensitivity_branches": 250, "attention_seconds": 7200},
@@ -121,7 +124,14 @@ ledger = {
     "attention_exit_code": int(sys.argv[3]),
     "signal_exit_code": int(sys.argv[4]),
 }
-(root / "campaign_budget.json").write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+budget_path = root / "campaign_budget.json"
+for _ in range(5):
+    budget_path.write_text(json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+    measured = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    if measured == ledger["output_bytes"]:
+        break
+    ledger["output_bytes"] = measured
+bytes_out = measured
 if total_wall > 12 * 3600 or branches > 400 or bytes_out > 30 * 1024**3:
     raise SystemExit("cumulative campaign cap exceeded")
 if stage_seconds.get("sensitivity", {}).get("wall_seconds", 0) > 10800:
@@ -132,5 +142,3 @@ if sum(stage_seconds.get(name, {}).get("wall_seconds", 0) for name in ("audit", 
     raise SystemExit("audit/smoke one-hour cap exceeded")
 print(json.dumps(ledger, indent=2))
 PY
-
-"$PYTHON" scripts/analyze_jrc_v4_followup.py --input-dir "$PILOT_DIR" --output-dir "$RUN_ROOT/report"

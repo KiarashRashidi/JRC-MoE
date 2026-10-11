@@ -16,6 +16,7 @@ from jrc_moe.jrc_v4.features import (FeatureRecord, affinity_channels, positiona
                                      post_rope_landmark_scores, router_statistics)
 from jrc_moe.jrc_v4.io import BudgetExhausted, BudgetLedger, atomic_write_json, bind_run_identity
 from jrc_moe.jrc_v4.replay import RNGSnapshot, capture_replay_state, control_cache_identity
+from jrc_moe.jrc_v4.resource_accounting import aggregate_stage_attempts
 from jrc_moe.jrc_v4.sampling import IndexedRandom, prompt_split_manifest, sample_equal_budget_exchanges
 from jrc_moe.jrc_v4.settings import ResourceCaps
 from jrc_moe.jrc_v4.statistics import exchange_effect, four_arm_interaction, kendall_tau_b, prompt_cluster_bootstrap
@@ -509,6 +510,15 @@ class StatisticsAndPolicyTests(unittest.TestCase):
 
 
 class ResourceSafetyTests(unittest.TestCase):
+    def test_campaign_ledger_sums_retried_stage_attempts(self):
+        stages = aggregate_stage_attempts([
+            ("audit", 3, 2), ("audit", 28, 2), ("audit", 461, 0), ("smoke", 865, 0),
+        ])
+        self.assertEqual(stages["audit"]["wall_seconds"], 492)
+        self.assertEqual(stages["audit"]["exit_code"], 0)
+        self.assertEqual(len(stages["audit"]["attempts"]), 3)
+        self.assertEqual(stages["smoke"]["wall_seconds"], 865)
+
     def test_caps_are_checked_before_branch_and_resume_keeps_counters(self):
         root = Path.cwd() / "outputs" / "jrc_v4" / "test_resource_ledger"
         root.mkdir(parents=True, exist_ok=True)
