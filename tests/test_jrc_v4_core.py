@@ -16,7 +16,7 @@ from jrc_moe.jrc_v4.features import (FeatureRecord, affinity_channels, positiona
                                      post_rope_landmark_scores, router_statistics)
 from jrc_moe.jrc_v4.io import BudgetExhausted, BudgetLedger, atomic_write_json, bind_run_identity
 from jrc_moe.jrc_v4.replay import RNGSnapshot, capture_replay_state, control_cache_identity
-from jrc_moe.jrc_v4.resource_accounting import aggregate_stage_attempts
+from jrc_moe.jrc_v4.resource_accounting import aggregate_stage_attempts, write_campaign_budget
 from jrc_moe.jrc_v4.sampling import IndexedRandom, prompt_split_manifest, sample_equal_budget_exchanges
 from jrc_moe.jrc_v4.settings import ResourceCaps
 from jrc_moe.jrc_v4.statistics import exchange_effect, four_arm_interaction, kendall_tau_b, prompt_cluster_bootstrap
@@ -518,6 +518,28 @@ class ResourceSafetyTests(unittest.TestCase):
         self.assertEqual(stages["audit"]["exit_code"], 0)
         self.assertEqual(len(stages["audit"]["attempts"]), 3)
         self.assertEqual(stages["smoke"]["wall_seconds"], 865)
+
+    def test_campaign_budget_includes_failed_attempts_and_final_report_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "stage_wall_seconds.tsv").write_text(
+                "audit\t3\t2\naudit\t28\t2\naudit\t461\t0\n"
+                "smoke\t865\t0\nsensitivity\t5\t0\nattention\t16\t0\nsignal\t0\t2\n",
+                encoding="utf-8")
+            for name, branches in (("smoke", 18), ("sensitivity", 154)):
+                folder = root / name
+                folder.mkdir()
+                (folder / "progress.json").write_text(json.dumps({"branches_started": branches}),
+                                                       encoding="utf-8")
+            report = root / "report"
+            report.mkdir()
+            (report / "final.md").write_text("final report bytes", encoding="utf-8")
+            ledger = write_campaign_budget(root, sensitivity_exit_code=0,
+                                           attention_exit_code=0, signal_exit_code=2)
+            self.assertEqual(ledger["stages"]["audit"]["wall_seconds"], 492)
+            self.assertEqual(ledger["total_wall_seconds"], 1378)
+            self.assertEqual(ledger["intervention_branches_started"], 172)
+            self.assertEqual(ledger["output_bytes"], sum(p.stat().st_size for p in root.rglob("*") if p.is_file()))
 
     def test_caps_are_checked_before_branch_and_resume_keeps_counters(self):
         root = Path.cwd() / "outputs" / "jrc_v4" / "test_resource_ledger"
