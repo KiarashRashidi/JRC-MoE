@@ -243,6 +243,7 @@ def generate_with_routing_mode(
                 sensitivity_observer({
                     "branch": branch, "global_nfe": global_nfe, "block_idx": block_idx,
                     "positions": tuple(unresolved_abs), "logits": active_logits,
+                    "input_token_ids": tuple(int(x[0, position].item()) for position in unresolved_abs),
                 })
 
             target_pred, target_conf = (

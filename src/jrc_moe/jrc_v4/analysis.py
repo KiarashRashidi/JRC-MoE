@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .predictors import RidgeBenefitPredictor, exchange_design
+from .predictors import RidgeBenefitPredictor
 from .sampling import IndexedRandom
 from .statistics import kendall_tau_b, paired_prompt_bootstrap
 from .io import atomic_write_json
@@ -31,6 +31,29 @@ def _token_features(row: dict) -> np.ndarray:
 
 def _router_features(row: dict) -> np.ndarray:
     return np.asarray([float(row["router"][key]) for key in ROUTER_KEYS], dtype=np.float64)
+
+
+def _role_aggregates(role_rows: dict[str, list[dict]], extractor, *, width: int, denominator: float) -> np.ndarray:
+    """Return deterministic mean/min/max summaries by action role and all candidates."""
+    chunks = []
+    for role in ("recipient", "donor", "unchanged_candidate", "all"):
+        rows = role_rows.get("all", []) if role == "all" else role_rows.get(role, [])
+        values = np.stack([extractor(row) for row in rows]) if rows else np.zeros((0, width), dtype=np.float64)
+        if len(values):
+            chunks.extend((values.mean(axis=0), values.min(axis=0), values.max(axis=0)))
+        else:
+            chunks.extend((np.zeros(width), np.zeros(width), np.zeros(width)))
+        chunks.append(np.asarray([len(values) / max(1.0, denominator)], dtype=np.float64))
+    return np.concatenate(chunks)
+
+
+def _json_list(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    return value if isinstance(value, list) else []
 
 
 def _sign_concordance(predictions: list[float], labels: list[float]) -> dict:
@@ -71,45 +94,67 @@ def run_pilot_analysis(*, pilot_dir: Path, output_dir: Path, seed: int = 2026100
     if not development or not validation or development & validation:
         raise ValueError("pilot split must have nonempty disjoint development and validation prompts")
 
-    features: dict[str, dict[str, dict]] = {}
+    features: dict[str, dict[int, dict]] = {}
     for line in feature_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         row = json.loads(line)
         exchange_id = row.get("extra", {}).get("exchange_id")
         role = row.get("extra", {}).get("role")
-        if exchange_id and role in {"recipient", "donor"}:
-            features.setdefault(str(exchange_id), {})[role] = row
+        if exchange_id and role in {"recipient", "donor", "unchanged_candidate"}:
+            # A position has one pre-decision record per action. If a resumed
+            # run appended a duplicate, retain one copy rather than changing
+            # its statistical weight.
+            features.setdefault(str(exchange_id), {})[int(row["position"])] = row
     outcomes = [json.loads(line) for line in outcome_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     outcomes.sort(key=lambda row: str(row["exchange_id"]))
     rows = []
     for outcome in outcomes:
         prompt = str(outcome["prompt_id"])
-        paired = features.get(str(outcome["exchange_id"]), {})
-        if set(paired) != {"recipient", "donor"}:
+        candidate_rows = list(features.get(str(outcome["exchange_id"]), {}).values())
+        if not candidate_rows:
             continue
-        recipient, donor = paired["recipient"], paired["donor"]
-        token_x = exchange_design(_token_features(recipient), _token_features(donor),
-                                  action_k=6, layer_idx=int(outcome["layer_idx"]))
-        router_x = exchange_design(_router_features(recipient), _router_features(donor),
-                                   action_k=6, layer_idx=int(outcome["layer_idx"]))
+        role_rows = {role: [row for row in candidate_rows if row.get("extra", {}).get("role") == role]
+                     for role in ("recipient", "donor", "unchanged_candidate")}
+        if not role_rows["recipient"] or not role_rows["donor"]:
+            continue
+        role_rows["all"] = candidate_rows
+        m = int(outcome.get("m") or len(candidate_rows))
+        c = int(outcome.get("c") or (len(role_rows["recipient"]) + len(role_rows["donor"])))
+        amount = int(outcome.get("A") or 1)
+        before = _json_list(outcome.get("K_before"))
+        base_k = float(np.mean([float(k) for k in before])) if before else 6.0
+        global_nfe = float(outcome.get("global_nfe", candidate_rows[0].get("global_nfe", 0)))
+        action_x = np.asarray([m / 16.0, c / 16.0, amount / 8.0, base_k / 8.0,
+                               float(outcome["layer_idx"]) / 15.0,
+                               global_nfe / 256.0], dtype=np.float64)
+        token_x = np.concatenate((_role_aggregates(role_rows, _token_features, width=12, denominator=m), action_x))
+        router_x = np.concatenate((_role_aggregates(role_rows, _router_features, width=len(ROUTER_KEYS), denominator=m),
+                                   action_x))
+        joint_x = np.concatenate((token_x[:-len(action_x)], router_x[:-len(action_x)], action_x))
         rows.append({"exchange_id": str(outcome["exchange_id"]), "prompt_id": prompt,
-                     "label": float(outcome["effect"]), "token_x": token_x, "router_x": router_x,
-                     "role_features": paired})
+                     "label": float(outcome["effect"]), "token_x": token_x,
+                     "router_x": router_x, "joint_x": joint_x,
+                     "role_features": role_rows, "m": m, "c": c, "A": amount})
     train = [r for r in rows if r["prompt_id"] in development]
     valid = [r for r in rows if r["prompt_id"] in validation]
     if not train or not valid:
         raise ValueError("no complete prompt-disjoint feature/outcome rows for both splits")
 
     models = {
-        "token_controls": RidgeBenefitPredictor(alpha=1.0).fit(
+        "token_only": RidgeBenefitPredictor(alpha=1.0).fit(
             np.stack([r["token_x"] for r in train]), [r["label"] for r in train],
             [r["prompt_id"] for r in train], allowed_training_prompts=development),
-        "router_controls": RidgeBenefitPredictor(alpha=1.0).fit(
+        "router_only": RidgeBenefitPredictor(alpha=1.0).fit(
             np.stack([r["router_x"] for r in train]), [r["label"] for r in train],
             [r["prompt_id"] for r in train], allowed_training_prompts=development),
+        "ungrouped_joint": RidgeBenefitPredictor(alpha=1.0).fit(
+            np.stack([r["joint_x"] for r in train]), [r["label"] for r in train],
+            [r["prompt_id"] for r in train], allowed_training_prompts=development),
     }
-    predicted = {name: model.predict(np.stack([r[f"{name.split('_')[0]}_x"] for r in valid]),
+    feature_keys = {"token_only": "token_x", "router_only": "router_x",
+                    "ungrouped_joint": "joint_x"}
+    predicted = {name: model.predict(np.stack([r[feature_keys[name]] for r in valid]),
                                      prompt_ids=[r["prompt_id"] for r in valid])
                  for name, model in models.items()}
     # An independently seeded random ranking provides a transparent low bar.
@@ -167,16 +212,28 @@ def run_pilot_analysis(*, pilot_dir: Path, output_dir: Path, seed: int = 2026100
         writer = csv.DictWriter(stream, fieldnames=["model", "exchange_id", "prompt_id", "prediction", "observed_effect"])
         writer.writeheader()
         writer.writerows(prediction_rows)
+    label_values = sorted({float(row["label"]) for row in rows})
+    g1_status = ("not_estimable_constant_binary_outcome" if len(label_values) <= 1
+                 else "blocked_missing_verified_attention_features")
     report = {
         "stage": "signal", "status": "exploratory_controls_complete",
-        "g1": "blocked_missing_verified_attention_features",
+        "g1": g1_status,
         "data_scope": "historical GSM8K-50 development/pilot only; not confirmatory",
         "split": {"development_prompts": len(development), "validation_prompts": len(validation),
                   "confirmatory_prompts": len(split.get("confirmatory", [])), "sha256": split["sha256"]},
         "rows": {"all_complete": len(rows), "train": len(train), "validation": len(valid)},
+        "binary_label_values": label_values,
         "predictors": metrics,
-        "unavailable_comparators": ["attention-only", "ungrouped-joint-attention-router"],
-        "reason": "The pilot intentionally kept attention features disabled until the actual post-QK-normalization/post-RoPE hook and fidelity gate are verified.",
+        "predictor_specs": {
+            "token_only": "confidence history, mask/refinement state, position, hidden-state norm, plus m/c/A/base-K/layer/NFE action covariates; recipient/donor/unchanged/all role summaries; no router or attention values",
+            "router_only": "router entropy, top-K mass, admission margin, next-expert gate, selected-K, plus action covariates; role summaries",
+            "ungrouped_joint": "ordinary ridge over concatenated token-only and router-only summaries; no community structure",
+            "random": "independent indexed random ranking",
+        },
+        "unavailable_comparators": ["attention-only", "attention-plus-router joint"],
+        "reason": ("Binary outcome is constant in the available rows; predictive value is not estimable. Attention features were disabled in the sensitivity run."
+                   if len(label_values) <= 1 else
+                   "Token-only, router-only, ungrouped-joint, and random controls were evaluated; attention-only and attention-plus-router comparisons remain blocked until runtime feature fidelity is verified and those features are collected."),
         "later_gates": {"G2": "not_run", "G3": "not_run", "G4": "not_run"},
     }
     atomic_write_json(output_dir / "signal_report.json", report)
@@ -185,8 +242,8 @@ def run_pilot_analysis(*, pilot_dir: Path, output_dir: Path, seed: int = 2026100
         f"Status: **{report['status']}**. G1: **{report['g1']}**.\n\n"
         f"Development/validation prompts: {len(development)}/{len(validation)}. "
         f"Complete paired rows: {len(rows)} (train {len(train)}, held-out validation {len(valid)}).\n\n"
-        "Token-control and router-control ridge baselines were fit on development prompts only. "
-        "Attention-only and joint attention/router comparisons are unavailable, so the joint-signal gate remains blocked. "
+        "Token-only, router-only, and ungrouped-joint ridge controls were fit on development prompts only, with action dose and context covariates. "
+        "Attention-only and attention-plus-router comparisons are unavailable, so the joint-signal gate remains blocked. "
         "These exploratory metrics do not support H1/H2 or confirmatory claims.\n",
         encoding="utf-8")
     return report

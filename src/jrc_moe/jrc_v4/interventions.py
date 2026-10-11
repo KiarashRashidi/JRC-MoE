@@ -56,7 +56,9 @@ def paired_exchange_rollout(*, model, prompt_ids, mode: str, controller: Layerwi
                             after_branch: Callable | None = None,
                             on_branch_error: Callable | None = None,
                             forward_observer: Callable | None = None,
-                            sensitivity_observer: Callable | None = None) -> dict:
+                            sensitivity_observer: Callable | None = None,
+                            control_cache: dict[str, dict] | None = None,
+                            control_cache_key: str | None = None) -> dict:
     """Run both arms to completion from the same exact pre-forward state.
 
     The generation routine owns threshold/fallback commits and later policy
@@ -64,19 +66,37 @@ def paired_exchange_rollout(*, model, prompt_ids, mode: str, controller: Layerwi
     """
     if state.global_nfe != exchange.global_nfe:
         raise ValueError("exchange target NFE must match the saved pre-forward state")
-    if state.selected_layer_idx is not None and (
-            state.selected_layer_idx != exchange.layer_idx
-            or state.recipient_position != exchange.recipient_position
-            or state.donor_position != exchange.donor_position):
-        raise ValueError("exchange identity differs from the selected site recorded in ReplayState")
+    if state.selected_layer_idx is not None:
+        if state.selected_layer_idx != exchange.layer_idx:
+            raise ValueError("exchange layer differs from the selected layer recorded in ReplayState")
+        if state.selected_positions:
+            if tuple(state.selected_positions) != tuple(exchange.candidate_positions):
+                raise ValueError("exchange candidate pool differs from the saved ReplayState identity")
+            if state.selected_action_digest != getattr(exchange, "action_digest", None):
+                raise ValueError("exchange action digest differs from the saved ReplayState identity")
+            if (not state.selected_action_record
+                    or state.selected_action_record.get("action_sha256") != state.selected_action_digest):
+                raise ValueError("saved ReplayState does not contain the matching full sparse action record")
+        elif (state.recipient_position != exchange.recipient_position
+              or state.donor_position != exchange.donor_position):
+            raise ValueError("exchange identity differs from the selected site recorded in ReplayState")
     from ..generation import generate_with_routing_mode
     import time
     import torch
 
     arm_results = {}
+    control_cache_hit = False
     for branch in ("control", "treatment"):
+        if branch == "control" and control_cache is not None and control_cache_key is not None:
+            cached = control_cache.get(control_cache_key)
+            if cached is not None:
+                arm_results[branch] = cached
+                control_cache_hit = True
+                continue
         if before_branch is not None:
-            before_branch(branch)
+            branch_id = before_branch(branch)
+        else:
+            branch_id = None
         cuda = torch.cuda.is_available()
         start_event = torch.cuda.Event(enable_timing=True) if cuda else None
         end_event = torch.cuda.Event(enable_timing=True) if cuda else None
@@ -117,7 +137,12 @@ def paired_exchange_rollout(*, model, prompt_ids, mode: str, controller: Layerwi
         if after_branch is not None:
             after_branch(branch, output, trace, meta, value,
                          elapsed_seconds=elapsed_seconds, gpu_seconds=gpu_seconds)
-        arm_results[branch] = {"output": output, "trace": trace, "meta": meta, "utility": value}
+        arm_results[branch] = {
+            "output": output, "trace": trace, "meta": meta, "utility": value,
+            "branch_id": branch_id,
+        }
+        if branch == "control" and control_cache is not None and control_cache_key is not None:
+            control_cache[control_cache_key] = arm_results[branch]
     control, treatment = arm_results["control"], arm_results["treatment"]
     return {
         "global_nfe": exchange.global_nfe,
@@ -125,6 +150,14 @@ def paired_exchange_rollout(*, model, prompt_ids, mode: str, controller: Layerwi
         "recipient_position": exchange.recipient_position,
         "donor_position": exchange.donor_position,
         "amount": exchange.amount,
+        "candidate_positions": tuple(getattr(exchange, "candidate_positions", ())),
+        "position_deltas": tuple(getattr(exchange, "position_deltas", ())),
+        "m": int(getattr(exchange, "m", len(getattr(exchange, "candidate_positions", ())))),
+        "c": int(getattr(exchange, "c", 2)),
+        "A": int(getattr(exchange, "A", exchange.amount)),
+        "action_digest": getattr(exchange, "action_digest", None),
+        "control_cache_hit": control_cache_hit,
+        "control_branch_id": control.get("branch_id"),
         "control_utility": control["utility"],
         "treatment_utility": treatment["utility"],
         "effect": exchange_effect(control["utility"], treatment["utility"]),

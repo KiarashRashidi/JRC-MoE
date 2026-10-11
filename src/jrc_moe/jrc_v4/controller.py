@@ -11,6 +11,15 @@ class BudgetExchange:
     donor_position: int
     amount: int = 1
 
+    @property
+    def candidate_positions(self) -> tuple[int, int]:
+        return (int(self.recipient_position), int(self.donor_position))
+
+    @property
+    def position_deltas(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        return ((int(self.recipient_position), int(self.amount)),
+                (int(self.donor_position), -int(self.amount)))
+
     def validate(self, num_layers: int, sequence_length: int, min_k: int, max_k: int) -> None:
         if self.global_nfe < 1 or not 0 <= self.layer_idx < num_layers:
             raise ValueError("exchange NFE/layer is out of range")
@@ -52,6 +61,7 @@ class LayerwiseKController:
         self._observed_layer_pairs: list[int | None] = []
         self._override_fires = 0
         self._route_records: dict[tuple[int, int], dict] = {}
+        self.capture_expert_contributions = False
 
     @property
     def sequence_length(self) -> int | None:
@@ -80,7 +90,21 @@ class LayerwiseKController:
         if global_nfe < 1:
             raise ValueError("global_nfe is one-based and must be positive")
         if exchange is not None:
-            exchange.validate(len(self.module_names), width, self.min_k, self.max_k)
+            if hasattr(exchange, "candidate_positions") and hasattr(exchange, "k_before"):
+                exchange.validate(len(self.module_names), width, self.min_k, self.max_k)
+            else:
+                exchange.validate(len(self.module_names), width, self.min_k, self.max_k)
+            if exchange.global_nfe == global_nfe:
+                layer_plan = matrix[exchange.layer_idx]
+                if hasattr(exchange, "k_before"):
+                    live_before = tuple(layer_plan[position] for position in exchange.candidate_positions)
+                    if live_before != tuple(exchange.k_before):
+                        raise ValueError("multi-token action K_before differs from the active layer plan")
+                if sum(delta for _, delta in exchange.position_deltas) != 0:
+                    raise ValueError("exchange adjustments must sum to zero")
+                for position, delta in exchange.position_deltas:
+                    if not 0 <= position < width or not self.min_k <= layer_plan[position] + delta <= self.max_k:
+                        raise ValueError("exchange adjustment is infeasible at the live K plan")
         if branch == "treatment" and exchange is None:
             raise ValueError("treatment branch requires an exchange")
         self._plan = tuple(matrix)
@@ -110,13 +134,16 @@ class LayerwiseKController:
         if self._branch == "treatment" and ex and ex.global_nfe == self._global_nfe and ex.layer_idx == layer_idx:
             if self._override_fires:
                 raise RuntimeError("exchange override fired more than once")
-            r, d = ex.recipient_position, ex.donor_position
-            if self._actual[layer_idx][r] + ex.amount > self.max_k:
-                raise ValueError("recipient would exceed Kmax")
-            if self._actual[layer_idx][d] - ex.amount < self.min_k:
-                raise ValueError("donor would fall below Kmin")
-            self._actual[layer_idx][r] += ex.amount
-            self._actual[layer_idx][d] -= ex.amount
+            deltas = getattr(ex, "position_deltas", None)
+            if deltas is None:
+                deltas = ((ex.recipient_position, ex.amount), (ex.donor_position, -ex.amount))
+            for position, delta in deltas:
+                if not 0 <= position < sequence_length:
+                    raise ValueError("exchange position is outside the live layer plan")
+                adjusted = self._actual[layer_idx][position] + delta
+                if not self.min_k <= adjusted <= self.max_k:
+                    raise ValueError("exchange adjustment violates K bounds at application time")
+                self._actual[layer_idx][position] = adjusted
             self._override_fires += 1
         return tuple(self._actual[layer_idx])
 
@@ -136,11 +163,28 @@ class LayerwiseKController:
             "experts": tuple(int(e) for e in experts),
             "weights": tuple(float(w) for w in weights),
             "hidden_state_norm": None if hidden_state_norm is None else float(hidden_state_norm),
+            "expert_contributions": [],
         }
         if router_logits is not None:
             from .features import router_statistics
             record["router_statistics"] = router_statistics(router_logits, k, selected_experts=experts)
         self._route_records[(layer_idx, position)] = record
+
+    def record_expert_contribution(self, layer_idx: int, position: int, expert_idx: int,
+                                   router_weight: float, output_norm: float,
+                                   weighted_output_norm: float) -> None:
+        """Record optional token/expert contribution norms for bounded mechanism probes."""
+        if not self.capture_expert_contributions:
+            return
+        record = self._route_records.get((layer_idx, position))
+        if record is None:
+            return
+        record["expert_contributions"].append({
+            "expert_id": int(expert_idx),
+            "router_weight": float(router_weight),
+            "expert_output_l2": float(output_norm),
+            "weighted_output_l2": float(weighted_output_norm),
+        })
 
     def record_layer_pairs(self, layer_idx: int, module_name: str, pair_count: int) -> None:
         if not self.enabled or not 0 <= layer_idx < len(self.module_names):
@@ -176,9 +220,18 @@ class LayerwiseKController:
                 self.enabled = False
                 raise RuntimeError("budget-neutral exchange changed target-layer budget")
             changed = [i for i, (a, b) in enumerate(zip(self._plan[ex.layer_idx], self._actual[ex.layer_idx])) if a != b]
-            if self._branch == "treatment" and set(changed) != {ex.recipient_position, ex.donor_position}:
+            expected_deltas = getattr(ex, "position_deltas", None)
+            if expected_deltas is None:
+                expected_deltas = ((ex.recipient_position, ex.amount), (ex.donor_position, -ex.amount))
+            expected_changed = {position for position, delta in expected_deltas if delta != 0}
+            if self._branch == "treatment" and set(changed) != expected_changed:
                 self.enabled = False
-                raise RuntimeError("exchange changed positions outside recipient and donor")
+                raise RuntimeError("exchange changed positions outside its sparse delta action")
+            if self._branch == "treatment":
+                for position, delta in expected_deltas:
+                    if self._actual[ex.layer_idx][position] - self._plan[ex.layer_idx][position] != delta:
+                        self.enabled = False
+                        raise RuntimeError("applied sparse K delta differs from requested action")
         result = {
             "global_nfe": self._global_nfe,
             "branch": self._branch,
@@ -187,6 +240,9 @@ class LayerwiseKController:
             "layer_pair_counts": tuple(int(n) for n in self._observed_layer_pairs),
             "direct_pairs": sum(int(n) for n in self._observed_layer_pairs),
             "override_fires": self._override_fires,
+            "candidate_positions": tuple(getattr(ex, "candidate_positions", ())) if ex else (),
+            "position_deltas": tuple(getattr(ex, "position_deltas", ())) if ex else (),
+            "action_digest": getattr(ex, "action_digest", None) if ex else None,
             "routing_records": dict(self._route_records),
         }
         self.enabled = False

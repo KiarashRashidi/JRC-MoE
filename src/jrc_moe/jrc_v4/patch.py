@@ -100,6 +100,19 @@ def install_layerwise_patch(model: Any, controller: LayerwiseKController,
                 observed_pairs += int(token_idx.numel())
                 expert_out = self.experts[expert_idx](flat[token_idx])
                 weighted = expert_out * selected_weights[token_idx, rank_idx, None]
+                if controller.capture_expert_contributions and _layer_idx in controller.monitored_layers:
+                    positions_cpu = token_idx.detach().cpu().tolist()
+                    keep = [i for i, position in enumerate(positions_cpu)
+                            if not controller.monitored_positions or position in controller.monitored_positions]
+                    if keep:
+                        keep_device = torch.as_tensor(keep, dtype=torch.long, device=flat.device)
+                        raw_norms = expert_out.index_select(0, keep_device).detach().float().norm(dim=-1).cpu().tolist()
+                        weighted_norms = weighted.index_select(0, keep_device).detach().float().norm(dim=-1).cpu().tolist()
+                        weights_cpu = selected_weights[token_idx, rank_idx].detach().float().cpu().tolist()
+                        for local_idx, raw_norm, weighted_norm in zip(keep, raw_norms, weighted_norms):
+                            controller.record_expert_contribution(
+                                _layer_idx, positions_cpu[local_idx], expert_idx,
+                                weights_cpu[local_idx], raw_norm, weighted_norm)
                 output.index_add_(0, token_idx, weighted.to(flat.dtype))
             controller.record_layer_pairs(_layer_idx, _name, observed_pairs)
             return output.reshape(batch_size, seq_len, hidden_dim) * contract.routed_scaling_factor

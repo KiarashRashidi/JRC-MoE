@@ -36,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="configs/jrc_v4/pilot.yaml")
     parser.add_argument("--output-dir")
     parser.add_argument("--audit-dir")
+    parser.add_argument("--smoke-dir")
     parser.add_argument("--input-dir")
     parser.add_argument("--fixed8-csv")
     parser.add_argument("--max-gpu-hours", type=float)
@@ -380,7 +381,9 @@ def _stage(args, root: Path, raw: dict, config_path: Path, output_dir: Path, cap
     if args.stage == "pilot":
         audit_path = audit_dir / "manifest.json"
         audit_digest = hashlib.sha256(audit_path.read_bytes()).hexdigest()
-        smoke = _gate_manifest(root / "outputs" / "jrc_v4" / "smoke")
+        smoke_dir = (_resolve_path(root, args.smoke_dir, "outputs/jrc_v4/smoke")
+                     if args.smoke_dir else root / "outputs" / "jrc_v4" / "smoke")
+        smoke = _gate_manifest(smoke_dir)
         blocker = _smoke_stage_blocker(smoke, evidence, digest, audit_digest)
         if blocker:
             return _blocked_stage(args.stage, output_dir, blocker, caps, digest, args.resume)
@@ -396,7 +399,8 @@ def _stage(args, root: Path, raw: dict, config_path: Path, output_dir: Path, cap
             os.environ["HF_HUB_OFFLINE"] = "1"
             os.environ["HF_DATASETS_OFFLINE"] = "1"
             from .pilot import run_pilot
-            prompt_limit = min(caps.max_prompts, 3 if args.stage == "smoke"
+            smoke_prompt_count = 1 if raw.get("followup") else 3
+            prompt_limit = min(caps.max_prompts, smoke_prompt_count if args.stage == "smoke"
                                else int(raw.get("sampling", {}).get("target_prompts", 50)))
             result = run_pilot(
                 root=root, output_dir=output_dir, raw_config=raw, config_digest=digest,

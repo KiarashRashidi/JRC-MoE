@@ -1,5 +1,6 @@
 import random
 import json
+import csv
 import os
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from jrc_moe.jrc_v4.controller import BudgetExchange, LayerwiseKController
 from jrc_moe.jrc_v4.features import (FeatureRecord, affinity_channels, positional_landmarks,
                                      post_rope_landmark_scores, router_statistics)
 from jrc_moe.jrc_v4.io import BudgetExhausted, BudgetLedger, atomic_write_json, bind_run_identity
-from jrc_moe.jrc_v4.replay import RNGSnapshot, capture_replay_state
+from jrc_moe.jrc_v4.replay import RNGSnapshot, capture_replay_state, control_cache_identity
 from jrc_moe.jrc_v4.sampling import IndexedRandom, prompt_split_manifest, sample_equal_budget_exchanges
 from jrc_moe.jrc_v4.settings import ResourceCaps
 from jrc_moe.jrc_v4.statistics import exchange_effect, four_arm_interaction, kendall_tau_b, prompt_cluster_bootstrap
@@ -156,6 +157,27 @@ class ReplayAndSamplingTests(unittest.TestCase):
         clone.confidence_history[2].append(0.9)
         self.assertEqual(state.input_ids[0][0], 1)
         self.assertEqual(state.confidence_history[2], [0.5])
+
+    def test_control_cache_identity_is_bound_to_state_k_policy_and_stream(self):
+        state = self._state()
+        baseline = ((8, 6, 6),)
+        first = control_cache_identity(
+            state, baseline_k=baseline, continuation_policy="fixed8_after_target_nfe",
+            branch_stream_id="coupled-0",
+        )
+        self.assertEqual(first, control_cache_identity(
+            state.clone(), baseline_k=baseline, continuation_policy="fixed8_after_target_nfe",
+            branch_stream_id="coupled-0",
+        ))
+        self.assertNotEqual(first, control_cache_identity(
+            state, baseline_k=baseline, continuation_policy="fixed8_after_target_nfe",
+            branch_stream_id="coupled-1",
+        ))
+        with self.assertRaises(ValueError):
+            control_cache_identity(
+                state, baseline_k=5, continuation_policy="fixed8_after_target_nfe",
+                branch_stream_id="coupled-0",
+            )
         selected = state.clone()
         selected.selected_layer_idx = 0
         selected.recipient_position = 1
@@ -183,6 +205,166 @@ class ReplayAndSamplingTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(row["recipient_k_after"] == 7 and row["donor_k_after"] == 5 for row in rows))
         self.assertTrue(all(row["selection_probability"] == 2 / 6 for row in rows))
+
+    def test_multitoken_reallocation_counts_budget_and_hashes_permutation_invariantly(self):
+        from jrc_moe.jrc_v4.multi_interventions import MultiTokenReallocation
+        action = MultiTokenReallocation(
+            global_nfe=5, layer_idx=0,
+            candidate_positions=(10, 11, 12, 13, 14),
+            k_before=(5, 5, 5, 5, 5),
+            deltas=((10, 1), (11, 1), (12, -1), (13, -1)),
+            selection_strategy="uniform", sampling_key=("p1", "s2"),
+        )
+        permuted = MultiTokenReallocation(
+            global_nfe=5, layer_idx=0,
+            candidate_positions=(14, 13, 12, 11, 10),
+            k_before=(5, 5, 5, 5, 5),
+            deltas=((13, -1), (12, -1), (11, 1), (10, 1)),
+            selection_strategy="uniform", sampling_key=("p1", "s2"),
+        )
+        self.assertEqual((action.m, action.c, action.A), (5, 4, 2))
+        self.assertEqual(action.k_after, (6, 6, 4, 4, 5))
+        self.assertEqual(action.action_digest, permuted.action_digest)
+        self.assertEqual(action.action_digest, action.action_digest)
+        self.assertEqual(action.to_record()["K_after"], [6, 6, 4, 4, 5])
+
+    def test_followup_slate_constructs_canonical_magnitude_and_group_sizes(self):
+        import math
+        from jrc_moe.jrc_v4.followup_sampling import build_action, initial_scale_slate
+        slate = initial_scale_slate()
+        self.assertEqual({int(row["m"]) for row in slate}, {2, 5, 8, 16})
+        self.assertIn((2, 2, 2), {(int(row["m"]), int(row["A"]), int(row["c"])) for row in slate})
+        self.assertIn((5, 2, 2), {(int(row["m"]), int(row["A"]), int(row["c"])) for row in slate})
+        self.assertIn((5, 2, 4), {(int(row["m"]), int(row["A"]), int(row["c"])) for row in slate})
+        rng = random.Random(17)
+        action, metadata = build_action(
+            global_nfe=1, layer_idx=4, candidate_positions=(10, 11), base_k=5,
+            amount=2, changed_count=2, selection_strategy="uniform", rng=rng,
+            sampling_key=("p1", "state0", "m2-A2"),
+        )
+        self.assertEqual((action.m, action.c, action.A), (2, 2, 2))
+        self.assertEqual(sorted(action.k_after), [3, 7])  # 5+5 -> 7+3, with order intentionally unspecified.
+        self.assertAlmostEqual(metadata["conditional_action_probability"], 0.5)
+        action5, metadata5 = build_action(
+            global_nfe=1, layer_idx=4, candidate_positions=(10, 11, 12, 13, 14), base_k=5,
+            amount=4, changed_count=4, selection_strategy="uniform", rng=random.Random(3),
+            sampling_key=("p1", "state0", "m5-A4"),
+        )
+        self.assertEqual((action5.m, action5.c, action5.A), (5, 4, 4))
+        self.assertEqual(sorted(action5.k_after), [3, 3, 5, 7, 7])
+        self.assertAlmostEqual(metadata5["conditional_action_probability"],
+                               1.0 / (math.comb(5, 4) * math.comb(4, 2)))
+
+    def test_token_only_and_router_margin_action_require_observed_features(self):
+        from jrc_moe.jrc_v4.followup_sampling import build_action
+        with self.assertRaises(ValueError):
+            build_action(
+                global_nfe=2, layer_idx=0, candidate_positions=(1, 2, 3, 4), base_k=5,
+                amount=2, changed_count=4, selection_strategy="router_margin", rng=random.Random(1),
+                sampling_key=("p2", "state1"),
+            )
+        action, _ = build_action(
+            global_nfe=2, layer_idx=0, candidate_positions=(1, 2, 3, 4), base_k=5,
+            amount=2, changed_count=4, selection_strategy="token_only", rng=random.Random(1),
+            sampling_key=("p2", "state1"), confidence={1: 0.1, 2: 0.3, 3: 0.8, 4: 0.9},
+        )
+        self.assertEqual(action.position_deltas, ((1, 1), (2, 1), (3, -1), (4, -1)))
+
+    def test_paired_trajectory_logits_are_compared_only_for_same_unresolved_token(self):
+        import torch
+        from jrc_moe.jrc_v4.sensitivity import PairedTrajectoryLogitComparator
+        comparator = PairedTrajectoryLogitComparator(target_nfe=3, candidate_positions=(10, 11), lookahead_steps=1)
+        control = torch.tensor([[3.0, 1.0, 0.0], [0.0, 2.0, 1.0]])
+        treatment = torch.tensor([[2.5, 1.1, 0.0], [3.0, 0.0, 1.0]])
+        comparator.observe(branch="control", global_nfe=3, positions=(10, 11),
+                           input_token_ids=(999, 999), logits=control)
+        comparator.observe(branch="treatment", global_nfe=3, positions=(10, 11),
+                           input_token_ids=(999, 999), logits=treatment)
+        comparator.observe(branch="control", global_nfe=4, positions=(10, 11),
+                           input_token_ids=(10, 11), logits=control)
+        comparator.observe(branch="treatment", global_nfe=4, positions=(10, 11),
+                           input_token_ids=(10, 12), logits=treatment)
+        result = comparator.result()
+        self.assertEqual(result["steps"][0]["compared_positions"], 2)
+        self.assertGreater(result["steps"][0]["jsd"], 0.0)
+        self.assertEqual(result["steps"][1]["compared_positions"], 1)
+        self.assertEqual(result["steps"][1]["missing_token_state_mismatch"], 1)
+        self.assertFalse(result["dense_logits_persisted"])
+
+    def test_multitoken_controller_applies_one_atomic_sparse_budget_neutral_change(self):
+        from jrc_moe.jrc_v4.multi_interventions import MultiTokenReallocation
+        names = ("layer.0", "layer.1")
+        controller = LayerwiseKController(names, min_k=2, max_k=8)
+        action = MultiTokenReallocation(
+            global_nfe=4, layer_idx=0,
+            candidate_positions=(2, 3, 4, 5, 6),
+            k_before=(5, 5, 5, 5, 5),
+            deltas=((2, 2), (3, 2), (4, -2), (5, -2)),
+            selection_strategy="uniform", sampling_key=("p2", "state7"),
+        )
+        plan = [[5] * 10, [5] * 10]
+        controller.begin_forward(plan, global_nfe=4, branch="treatment", exchange=action)
+        changed = controller.for_layer(0, names[0], 10)
+        untouched = controller.for_layer(1, names[1], 10)
+        self.assertEqual(changed, (5, 5, 7, 7, 3, 3, 5, 5, 5, 5))
+        self.assertEqual(untouched, tuple([5] * 10))
+        controller.record_layer_pairs(0, names[0], sum(changed))
+        controller.record_layer_pairs(1, names[1], sum(untouched))
+        result = controller.end_forward()
+        self.assertEqual(result["override_fires"], 1)
+        self.assertEqual(result["layer_pair_counts"], (50, 50))
+        self.assertEqual(result["position_deltas"], action.deltas)
+        self.assertEqual(set(i for i, value in enumerate(changed) if value != 5), {2, 3, 4, 5})
+
+    def test_multitoken_infeasible_actions_fail_without_clipping_and_non_target_is_untouched(self):
+        from jrc_moe.jrc_v4.multi_interventions import MultiTokenReallocation
+        with self.assertRaises(ValueError):
+            MultiTokenReallocation(
+                global_nfe=1, layer_idx=0, candidate_positions=(1, 2),
+                k_before=(5, 5), deltas=((1, 4), (2, -4)),
+            )
+        with self.assertRaises(ValueError):
+            MultiTokenReallocation(
+                global_nfe=1, layer_idx=0, candidate_positions=(1, 2),
+                k_before=(5, 5), deltas=((1, 2), (2, -1)),
+            )
+        action = MultiTokenReallocation(
+            global_nfe=1, layer_idx=0, candidate_positions=(1, 2),
+            k_before=(5, 5), deltas=((1, 2), (2, -2)),
+        )
+        controller = LayerwiseKController(("layer.0",), min_k=2, max_k=8)
+        # After the intervention NFE the fixed-K8 continuation plan is legal;
+        # the old action must not be revalidated against its K_before vector.
+        controller.begin_forward([[8] * 4], global_nfe=2, branch="treatment", exchange=action)
+        allocation = controller.for_layer(0, "layer.0", 4)
+        controller.record_layer_pairs(0, "layer.0", sum(allocation))
+        self.assertEqual(controller.end_forward()["override_fires"], 0)
+        self.assertEqual(allocation, (8, 8, 8, 8))
+
+    def test_generalized_replay_identity_requires_matching_action_digest(self):
+        from jrc_moe.jrc_v4.multi_interventions import MultiTokenReallocation
+        from jrc_moe.jrc_v4.interventions import paired_exchange_rollout
+        action = MultiTokenReallocation(
+            global_nfe=1, layer_idx=0, candidate_positions=(0, 1, 2),
+            k_before=(5, 5, 5), deltas=((0, 1), (1, -1)),
+        )
+        state = self._state()
+        state.selected_layer_idx = 0
+        state.selected_positions = action.candidate_positions
+        state.selected_action_digest = action.action_digest
+        state.selected_action_record = action.to_record()
+        state.__post_init__()
+        with self.assertRaises(ValueError):
+            paired_exchange_rollout(
+                model=None, prompt_ids=None, mode="test",
+                controller=LayerwiseKController(("layer.0",)), state=state,
+                exchange=MultiTokenReallocation(
+                    global_nfe=1, layer_idx=0, candidate_positions=(0, 1, 2),
+                    k_before=(5, 5, 5),
+                    deltas=((0, 2), (1, -2)),
+                ), allocation_provider=lambda **kw: [], utility=lambda _: 0,
+                checkpoint_revision="rev", config_digest="digest",
+            )
 
     def test_replay_selected_site_must_match_exchange(self):
         from jrc_moe.jrc_v4.interventions import paired_exchange_rollout
@@ -272,6 +454,43 @@ class StatisticsAndPolicyTests(unittest.TestCase):
             self.assertEqual(report["rows"], {"all_complete": 18, "train": 12, "validation": 6})
             self.assertEqual(report["split"]["confirmatory_prompts"], 0)
             self.assertTrue((output / "predictions.csv").is_file())
+
+    def test_followup_report_keeps_zero_labels_and_separates_resource_and_dose_metrics(self):
+        from scripts.analyze_jrc_v4_followup import summarize
+        root = Path.cwd() / "outputs" / "jrc_v4" / "test_followup_analysis"
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root) as temporary:
+            source, report_dir = Path(temporary) / "sensitivity", Path(temporary) / "report"
+            source.mkdir()
+            manifest = {"stage": "pilot", "status": "passed", "g0": "passed",
+                        "branches_started": 4, "gpu_seconds": 12.0, "gpu_hours": 12.0 / 3600,
+                        "resource_caps": {"max_branches": 250}, "states_captured": 2,
+                        "stop_reason": None, "infeasible_or_no_site": 0}
+            (source / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            outcomes = []
+            for prompt in ("a", "b"):
+                outcomes.append({"exchange_id": prompt, "prompt_id": prompt, "condition": "dose_m2_A2",
+                                 "m": 2, "c": 2, "A": 2, "selection_strategy": "uniform",
+                                 "effect": 0, "control_correct": 1, "treatment_correct": 1,
+                                 "tier1_mean_jsd": 0.1, "trajectory_pair_delta": 0,
+                                 "final_token_edit_count": 0, "trace_changed_nfe_count": 0})
+            (source / "paired_exchange_records.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in outcomes), encoding="utf-8")
+            (source / "actions.jsonl").write_text(
+                "".join(json.dumps({"exchange_id": row["exchange_id"], "status": status}) + "\n"
+                        for row in outcomes for status in ("planned", "completed")), encoding="utf-8")
+            (source / "branch_outcomes.jsonl").write_text("", encoding="utf-8")
+            (source / "features.jsonl").write_text("", encoding="utf-8")
+            with (source / "tier1_metrics.csv").open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=["offset_from_intervention", "compared_positions", "jsd"])
+                writer.writeheader()
+                writer.writerow({"offset_from_intervention": 0, "compared_positions": 2, "jsd": 0.1})
+            report = summarize(source, report_dir)
+            self.assertEqual(report["g1"], "not_estimable_constant_binary_outcome")
+            self.assertEqual(report["paired_outcomes"], 2)
+            self.assertEqual(report["actions_logged"], 2)
+            self.assertEqual(report["aligned_candidate_position_comparisons"], 2)
+            self.assertTrue((report_dir / "followup_report.md").is_file())
 
     def test_communities_are_past_only_chronological_and_bounded(self):
         first = PastOnlyCommunities(4, neighbor_cap=2, max_group_size=3, passes=2, history_window=2)
