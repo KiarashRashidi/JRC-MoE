@@ -24,6 +24,18 @@ def _read_jsonl_gz(path: Path) -> list[dict]:
         return [json.loads(line) for line in stream if line.strip()]
 
 
+def _iter_trajectory_records(trajectory_items: Iterable[tuple[tuple, Mapping]]) -> Iterable[dict]:
+    # Yield one decompressed trajectory at a time to bound analysis memory.
+    for _, index in trajectory_items:
+        raw = Path(index["raw_path"])
+        events = _read_jsonl_gz(raw / "events.jsonl.gz")
+        positions = _read_jsonl_gz(raw / "positions.jsonl.gz")
+        relations = _read_jsonl_gz(raw / "relations.jsonl.gz")
+        output = json.loads((raw / "prompt_output.json").read_text(encoding="utf-8"))
+        yield {"index": index, "events": events, "positions": positions,
+               "relations": relations, "output": output, "raw": raw}
+
+
 def _rank(values: Sequence[float]) -> list[float]:
     order = sorted(range(len(values)), key=lambda i: (values[i], i))
     ranks = [0.0] * len(values)
@@ -281,27 +293,23 @@ def analyze(root: str | Path, *, config: Mapping) -> dict:
     if manifest_path.is_file():
         run_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     run_id = run_manifest.get("run_id")
-    trajectories = []
-    for key, index in sorted(index_rows.items()):
-        if run_id and key[0] != run_id:
-            continue
-        raw = Path(index["raw_path"])
-        events = _read_jsonl_gz(raw / "events.jsonl.gz")
-        positions = _read_jsonl_gz(raw / "positions.jsonl.gz")
-        relations = _read_jsonl_gz(raw / "relations.jsonl.gz")
-        output = json.loads((raw / "prompt_output.json").read_text(encoding="utf-8"))
-        trajectories.append({"index": index, "events": events, "positions": positions,
-                             "relations": relations, "output": output, "raw": raw})
+    trajectory_items = [
+        (key, index) for key, index in sorted(index_rows.items())
+        if not run_id or key[0] == run_id
+    ]
+    trajectory_count = len(trajectory_items)
+    trajectory_prompt_ids = sorted({str(index["prompt_id"]) for _, index in trajectory_items})
+    trajectory_modes = sorted({str(index["mode"]) for _, index in trajectory_items})
 
     bootstrap_draws = int(config.get("analysis", {}).get("cluster_bootstrap_draws", 2000))
     bootstrap_seed = int(config.get("analysis", {}).get("bootstrap_seed", 20261012))
     block_length = int(config.get("study", {}).get("block_length", 32))
-    prompt_splits = {str(t["index"]["prompt_id"]): stable_prompt_split(
-        str(t["index"]["prompt_id"]), seed=bootstrap_seed,
+    prompt_splits = {prompt_id: stable_prompt_split(
+        prompt_id, seed=bootstrap_seed,
         validation_fraction=float(config.get("analysis", {}).get("validation_fraction", 0.30)))
-        for t in trajectories}
+        for prompt_id in trajectory_prompt_ids}
     expert_counts, layer_exposures = {}, {}
-    for trajectory in trajectories:
+    for trajectory in _iter_trajectory_records(trajectory_items):
         if prompt_splits.get(str(trajectory["index"]["prompt_id"])) != "development":
             continue
         for row in trajectory["relations"]:
@@ -343,7 +351,7 @@ def analyze(root: str | Path, *, config: Mapping) -> dict:
     D8_joint = {}
     D11_attention = {}
 
-    for trajectory in trajectories:
+    for trajectory in _iter_trajectory_records(trajectory_items):
         index, events, positions = trajectory["index"], trajectory["events"], trajectory["positions"]
         relations, output = trajectory["relations"], trajectory["output"]
         prompt_id, mode = str(index["prompt_id"]), str(index["mode"])
@@ -666,10 +674,10 @@ def analyze(root: str | Path, *, config: Mapping) -> dict:
                    for h in horizons}
     plots = _plot_outputs(analysis_dir, summaries, model_results, raster)
     report = {"schema_version": "natural-reflex-analysis-v1",
-              "status": "evaluated" if trajectories else "blocked_no_valid_gpu_trajectories",
-              "run_id": run_id, "trajectory_count": len(trajectories),
-              "prompts": sorted({str(t["index"]["prompt_id"]) for t in trajectories}),
-              "modes": sorted({str(t["index"]["mode"]) for t in trajectories}),
+              "status": "evaluated" if trajectory_count else "blocked_no_valid_gpu_trajectories",
+              "run_id": run_id, "trajectory_count": trajectory_count,
+              "prompts": trajectory_prompt_ids,
+              "modes": trajectory_modes,
               "prompt_split": prompt_splits,
               "historical_gsm8k_sample_warning": "historical first-50 development prompts are exploratory and not confirmatory",
               "label_counts_by_horizon": label_counts, "pair_counts_by_horizon": pair_counts,
@@ -683,7 +691,7 @@ def analyze(root: str | Path, *, config: Mapping) -> dict:
     _write_csv(analysis_dir / "D13_attention_degree.csv", degree_rows)
     paragraphs = [
         "# Natural REFLEX observational study report", "",
-        f"Status: **{report['status']}**. Trajectories: {len(trajectories)} across modes {report['modes']}.",
+        f"Status: **{report['status']}**. Trajectories: {trajectory_count} across modes {report['modes']}.",
         "", "This report uses unmodified native REFLEX and Fixed8 rollouts. It is observational and does not test expert-budget allocation, causal effects, inference speedup, or community superiority.",
         "", "## Data and split", "",
         f"Prompt IDs are split by stable hash: {sum(v == 'development' for v in prompt_splits.values())} development and {sum(v == 'validation' for v in prompt_splits.values())} validation clusters. All observations for a prompt remain together.",
