@@ -12,6 +12,12 @@ git status --short --branch
 git rev-parse HEAD
 source /home/new_drive/rashidi/venvs/reflex-llada/bin/activate
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HOME=/home/new_drive/rashidi/hf_cache
+export HF_HUB_CACHE="$HF_HOME/hub"
+export HF_MODULES_CACHE="$HF_HOME/modules"
+export HF_HUB_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export JRC_MOE_GSM8K_DIR=/home/new_drive/rashidi/JRC-MoE-followup/data/gsm8k
 python -V
 python -c 'import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))'
 nvidia-smi
