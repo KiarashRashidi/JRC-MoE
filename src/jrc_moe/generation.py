@@ -740,6 +740,9 @@ def validate_trace(
             )
 
     allowed = {
+        "fixed8": {
+            8,
+        },
         MODE_RRB: {
             4,
             8,
