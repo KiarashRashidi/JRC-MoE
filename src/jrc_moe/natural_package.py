@@ -10,6 +10,7 @@ import zipfile
 from .natural_storage import NaturalRunStore, atomic_write_json, sha256_file
 
 MAX_LITE_BYTES = 100 * 1024 * 1024
+MAX_LITE_RAW_BYTES = 60 * 1024 * 1024
 
 
 def _write_review_docs(root: Path) -> None:
@@ -87,26 +88,60 @@ def _zip_tree(source: Path, archive: Path, *, include=None) -> dict:
             "sha256": sha256_file(archive), "integrity": "passed"}
 
 
-def _lite_file_selection(root: Path) -> list[Path]:
-    """Keep every summary/output/index and a deterministic raw-trajectory subset."""
-    selected = []
-    selected += [p for p in root.rglob("*") if p.is_file()
-                 and ("analysis" in p.parts or p.name in {"run_manifest.json", "campaign_ledger.json",
-                    "RUNBOOK.md", "data_dictionary.md", "REVIEW_README.md", "HOW_TO_REPRODUCE.md",
-                    "MANIFEST.txt", "SHA256SUMS"})]
+def _lite_raw_trajectory_ids(root: Path) -> set[str]:
+    """Select up to five raw examples per mode within a shared 60 MiB budget."""
     store = NaturalRunStore(root)
     indices = list(store.completed().values())
     buckets = {}
     for row in indices:
         buckets.setdefault(str(row["mode"]), []).append(row)
     chosen_ids = set()
+    total_bytes = 0
     for mode, rows in buckets.items():
+        mode_bytes = 0
+        selected_for_mode = 0
         rows = sorted(rows, key=lambda r: hashlib.sha256(
             f"{r['prompt_id']}:{r['seed']}:{mode}".encode()).hexdigest())
-        chosen_ids.update(r["trajectory_id"] for r in rows[:5])
+        for row in rows:
+            if selected_for_mode >= 5:
+                break
+            raw = Path(row["raw_path"])
+            if not raw.is_absolute():
+                raw = root / raw
+            if not raw.is_dir():
+                continue
+            size = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+            if mode_bytes + size > MAX_LITE_RAW_BYTES // max(1, len(buckets)):
+                continue
+            if total_bytes + size > MAX_LITE_RAW_BYTES:
+                continue
+            mode_bytes += size
+            total_bytes += size
+            chosen_ids.add(row["trajectory_id"])
+            selected_for_mode += 1
+    return chosen_ids
+
+
+def _lite_file_selection(root: Path) -> list[Path]:
+    """Keep summaries, indexes, and a deterministic size-bounded raw subset."""
+    selected = []
+    summary_suffixes = {".json", ".csv", ".png", ".md"}
+    analysis_dir = root / "analysis"
+    if analysis_dir.is_dir():
+        selected += [p for p in analysis_dir.iterdir() if p.is_file()
+                     and p.suffix.lower() in summary_suffixes]
+    selected += [p for p in root.rglob("*") if p.is_file() and p.name in {
+        "run_manifest.json", "campaign_ledger.json", "RUNBOOK.md", "data_dictionary.md",
+        "REVIEW_README.md", "HOW_TO_REPRODUCE.md", "50_PROMPT_SCIENTIFIC_REPORT.md",
+        "MANIFEST.txt", "SHA256SUMS"}]
+    store = NaturalRunStore(root)
+    indices = list(store.completed().values())
+    chosen_ids = _lite_raw_trajectory_ids(root)
     for row in indices:
         if row["trajectory_id"] in chosen_ids:
             raw = Path(row["raw_path"])
+            if not raw.is_absolute():
+                raw = root / raw
             selected.extend(p for p in raw.rglob("*") if p.is_file())
         else:
             path = root / "trajectories" / "index" / f"{row['trajectory_id']}.json"
@@ -149,8 +184,10 @@ def package_review(root: str | Path, *, output_path: str | Path | None = None) -
     lite = _zip_tree(root, lite_path, include=selected)
     if lite["bytes"] > MAX_LITE_BYTES:
         raise RuntimeError(f"review-lite ZIP exceeds 100 MB: {lite['bytes']} bytes")
+    selected_raw_count = len(_lite_raw_trajectory_ids(root))
     return {"full_archive": full, "review_archive": lite,
             "review_size_cap_bytes": MAX_LITE_BYTES, "lite_subset": True,
-            "excluded_raw_trajectory_count": max(0, len(NaturalRunStore(root).completed()) - 10),
-            "sampling_rule": "up to five trajectories per mode by SHA256(prompt_id,seed,mode)"}
+            "included_raw_trajectory_count": selected_raw_count,
+            "excluded_raw_trajectory_count": max(0, len(NaturalRunStore(root).completed()) - selected_raw_count),
+            "sampling_rule": "up to five trajectories per mode, SHA256(prompt_id,seed,mode) order, 60 MiB combined raw cap"}
 

@@ -284,6 +284,24 @@ class AnalysisPackagingTests(unittest.TestCase):
             with zipfile.ZipFile(second["full_archive"]["path"]) as archive:
                 self.assertFalse(any(name.endswith(".zip") for name in archive.namelist()))
 
+    def test_lite_selection_keeps_summaries_but_excludes_full_label_streams(self):
+        import tempfile
+        from pathlib import Path
+        from jrc_moe.natural_package import _lite_file_selection
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            analysis = root / "analysis"
+            analysis.mkdir()
+            (root / "50_PROMPT_SCIENTIFIC_REPORT.md").write_text("report", encoding="utf-8")
+            (analysis / "natural_report.md").write_text("summary", encoding="utf-8")
+            (analysis / "analysis.json").write_text("{}", encoding="utf-8")
+            (analysis / "at_risk_labels_h1.jsonl.gz").write_bytes(b"large label stream")
+            selected = {path.relative_to(root).as_posix() for path in _lite_file_selection(root)}
+            self.assertIn("50_PROMPT_SCIENTIFIC_REPORT.md", selected)
+            self.assertIn("analysis/natural_report.md", selected)
+            self.assertIn("analysis/analysis.json", selected)
+            self.assertNotIn("analysis/at_risk_labels_h1.jsonl.gz", selected)
+
 
 if __name__ == "__main__":
     unittest.main()
