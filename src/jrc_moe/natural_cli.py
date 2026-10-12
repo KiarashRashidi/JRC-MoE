@@ -443,6 +443,7 @@ def _collect(args, root: Path, config: dict, config_path: Path,
         from .generation import generate_with_routing_mode, postprocess_generated_region
         from .grading import canonical_grade_text
         from .observational import validate_trajectory, stable_prompt_split
+        from .natural_features import NaturalFeatureObserver
         import torch
 
         model, tokenizer = load_model()
