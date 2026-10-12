@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 OUT="${NATURAL_REFLEX_OUT:-outputs/natural_reflex}"
 LOG_DIR="$OUT/logs"
 mkdir -p "$LOG_DIR"

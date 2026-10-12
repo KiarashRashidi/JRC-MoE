@@ -11,6 +11,7 @@ cd /path/to/JRC-MoE
 git status --short --branch
 git rev-parse HEAD
 source /home/new_drive/rashidi/venvs/reflex-llada/bin/activate
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 python -V
 python -c 'import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))'
 nvidia-smi
@@ -70,5 +71,7 @@ python -m jrc_moe.cli natural collect --config configs/natural_reflex/pilot.yaml
 python -m jrc_moe.cli natural analyze --config configs/natural_reflex/pilot.yaml
 python -m jrc_moe.cli natural package --config configs/natural_reflex/pilot.yaml
 ```
+
+Set `PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"` in the active shell before issuing these commands, as the wrapper does automatically. This ensures the selected worktree's implementation is imported even if the environment has another checkout installed in editable mode.
 
 Override `--out` only to intentionally create a separate campaign. Use the same config, input CSV, checkpoint revision, and source commit for every resumed stage.
