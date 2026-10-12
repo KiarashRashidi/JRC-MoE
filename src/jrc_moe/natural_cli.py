@@ -440,7 +440,7 @@ def _collect(args, root: Path, config: dict, config_path: Path,
         from .config import NUM_MOE_LAYERS
         from .data import load_fixed8
         from .runner import _prepare
-        from .generation import generate_with_routing_mode, postprocess_generated_region
+        from .generation import generate_with_routing_mode, postprocess_generated_region, validate_trace
         from .grading import canonical_grade_text
         from .observational import validate_trajectory, stable_prompt_split
         from .natural_features import NaturalFeatureObserver
@@ -482,20 +482,21 @@ def _collect(args, root: Path, config: dict, config_path: Path,
                                   "checkpoint_hash": identity["checkpoint_revision"],
                                   "prompt_length": int(prepared[idx]["input_ids"].shape[1]),
                                   "diagnostic_test_idx": int(idx)}
-                observer = NaturalFeatureObserver(
-                    tx, prompt_len=int(prepared[idx]["input_ids"].shape[1]),
-                    router_layers=tuple(feature.get("router_layers", (4, 12))),
-                    router_stride=int(feature.get("router_stride", 1)),
-                    attention_layers=tuple(feature.get("attention_layers", (4, 12))),
-                    attention_heads=tuple(feature.get("attention_heads", (0, 4, 8, 12))),
-                    landmark_count=int(feature.get("landmark_count", 8)),
-                    attention_stride=int(feature.get("attention_stride", 1)),
-                    attention_audit=audit, attention_enabled=attention_enabled,
-                    max_forward_record_bytes=output_bound,
-                )
-                install_info = observer.install(model)
-                _torch_seed(torch, seed)
+                observer = None
                 try:
+                    observer = NaturalFeatureObserver(
+                        tx, prompt_len=int(prepared[idx]["input_ids"].shape[1]),
+                        router_layers=tuple(feature.get("router_layers", (4, 12))),
+                        router_stride=int(feature.get("router_stride", 1)),
+                        attention_layers=tuple(feature.get("attention_layers", (4, 12))),
+                        attention_heads=tuple(feature.get("attention_heads", (0, 4, 8, 12))),
+                        landmark_count=int(feature.get("landmark_count", 8)),
+                        attention_stride=int(feature.get("attention_stride", 1)),
+                        attention_audit=audit, attention_enabled=attention_enabled,
+                        max_forward_record_bytes=output_bound,
+                    )
+                    install_info = observer.install(model)
+                    _torch_seed(torch, seed)
                     out, trace, meta = generate_with_routing_mode(
                         model, prepared[idx]["input_ids"], mode, controller,
                         observational_observer=observer, event_metadata=event_metadata,
@@ -532,7 +533,11 @@ def _collect(args, root: Path, config: dict, config_path: Path,
                                          "record_counts": index["record_counts"]})
                     print(json.dumps(trajectories[-1]))
                 except BaseException:
-                    observer.close()
+                    if observer is not None:
+                        try:
+                            observer.close()
+                        except BaseException:
+                            pass
                     if not tx._closed:
                         tx.abort(reason="collection trajectory failed")
                     raise
