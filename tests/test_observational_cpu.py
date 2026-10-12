@@ -148,6 +148,30 @@ class PredictionTests(unittest.TestCase):
 
 
 class FeatureTests(unittest.TestCase):
+    def test_relation_index_preserves_per_forward_attention_and_router_views(self):
+        from jrc_moe.natural_analysis import (
+            _attention_edges, _index_relations_by_source, _router_sets,
+        )
+
+        rows = [
+            {"block_idx": 0, "source_local_nfe": 1,
+             "feature_type": "pre_admission_router_logits_and_topk",
+             "position_relative": 4, "layer_idx": 2, "experts": [1, 3]},
+            {"block_idx": 0, "source_local_nfe": 1,
+             "score_semantics": "post_qk_norm_post_rope_scaled_dot_product_score",
+             "direction": "unresolved_to_key", "edge_category": "unresolved_active",
+             "query_position_relative": 4, "key_position_relative": 5, "raw_qk_score": 0.25},
+            {"block_idx": 0, "source_local_nfe": 2,
+             "feature_type": "pre_admission_router_logits_and_topk",
+             "position_relative": 4, "layer_idx": 2, "experts": [2, 3]},
+        ]
+        indexed = _index_relations_by_source(rows)
+        self.assertEqual(len(indexed[(0, 1)]), 2)
+        self.assertEqual(_attention_edges(rows, 1, block_idx=0),
+                         _attention_edges(indexed[(0, 1)], 1, block_idx=0))
+        self.assertEqual(_router_sets(rows, 1, block_idx=0),
+                         _router_sets(indexed[(0, 1)], 1, block_idx=0))
+
     def test_raw_attention_edges_are_separated_by_direction_and_key_role(self):
         rows = [
             {"focus_position_abs": 50, "query_position_abs": 50, "key_position_abs": 51,

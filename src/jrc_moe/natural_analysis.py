@@ -109,6 +109,19 @@ def _router_sets(relations: Sequence[Mapping], source_local: int, *, block_idx: 
     return result
 
 
+def _index_relations_by_source(relations: Sequence[Mapping]) -> dict[tuple[int, int], list[Mapping]]:
+    """Index per-forward relation rows once instead of rescanning a trajectory for every event."""
+    indexed: dict[tuple[int, int], list[Mapping]] = {}
+    for row in relations:
+        try:
+            key = (int(row.get("block_idx", -1)), int(row.get("source_local_nfe", -1)))
+        except (TypeError, ValueError):
+            continue
+        if key[0] >= 0 and key[1] >= 0:
+            indexed.setdefault(key, []).append(row)
+    return indexed
+
+
 def _attention_edges(relations: Sequence[Mapping], source_local: int, *, block_idx: int) -> dict[tuple[int, int], list[float]]:
     result = {}
     for row in relations:
@@ -335,6 +348,7 @@ def analyze(root: str | Path, *, config: Mapping) -> dict:
         relations, output = trajectory["relations"], trajectory["output"]
         prompt_id, mode = str(index["prompt_id"]), str(index["mode"])
         trajectory_key = (prompt_id, mode)
+        relations_by_source = _index_relations_by_source(relations)
         validation = validate_trajectory(events)
         if validation["status"] != "passed":
             raise RuntimeError(f"stored trajectory failed revalidation: {trajectory_key}")
@@ -410,8 +424,10 @@ def analyze(root: str | Path, *, config: Mapping) -> dict:
             # D5–D7, D11 and D13 use relations from the previous local forward.
             source_local = int(event["local_nfe"]) - 1
             if source_local >= 1:
-                edges = _attention_edges(relations, source_local, block_idx=int(event["block_idx"]))
-                route_sets = _router_sets(relations, source_local, block_idx=int(event["block_idx"]))
+                block_idx = int(event["block_idx"])
+                source_relations = relations_by_source.get((block_idx, source_local), ())
+                edges = _attention_edges(source_relations, source_local, block_idx=block_idx)
+                route_sets = _router_sets(source_relations, source_local, block_idx=block_idx)
                 pair_attention = {}
                 pair_router = {}
                 pair_router_adjusted = {}
