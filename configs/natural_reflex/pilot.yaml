@@ -30,6 +30,6 @@ resources:
   max_gpu_hours: 4
   max_output_gib: 10
   attention_audit_reserve_seconds: 900
-  smoke_reserve_seconds: 10800
-  collect_reserve_seconds: 10800
+  smoke_reserve_seconds: 1000
+  collect_reserve_seconds: 9400
   max_forward_record_bytes_mib: 128
