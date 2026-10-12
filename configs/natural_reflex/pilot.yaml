@@ -1,0 +1,35 @@
+study:
+  name: natural-reflex-unmasking-temporal-characterization
+  modes: [reflex, fixed8]
+  seed_base: 20261011
+  smoke_prompts: 3
+  initial_pilot_prompts: 10
+  maximum_prompts: 50
+  generation_length: 256
+  block_length: 32
+  threshold: 0.90
+  primary_sample: historical_gsm8k_first_50_development_exploration
+data:
+  fixed8_csv: data/diagnostic_50_results.csv
+features:
+  router_layers: [4, 12]
+  router_stride: 1
+  attention_layers: [4, 12]
+  attention_heads: [0, 4, 8, 12]
+  attention_stride: 1
+  landmark_count: 8
+  community_enabled: false
+analysis:
+  horizons: [1, 2, 4]
+  validation_fraction: 0.30
+  minimum_training_prompts: 3
+  cluster_bootstrap_draws: 2000
+  bootstrap_seed: 20261012
+  pair_max_per_event: 4096
+resources:
+  max_gpu_hours: 4
+  max_output_gib: 10
+  attention_audit_reserve_seconds: 900
+  smoke_reserve_seconds: 10800
+  collect_reserve_seconds: 10800
+  max_forward_record_bytes_mib: 128

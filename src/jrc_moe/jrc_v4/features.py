@@ -9,19 +9,29 @@ import numpy as np
 
 
 def router_statistics(logits: Sequence[float], k: int, *, selected_experts: Sequence[int] | None = None,
-                      expert_bias_enabled: bool = False) -> dict[str, float | int]:
-    """Compute full-distribution controls before admission, never from top-K only."""
+                      expert_bias_enabled: bool = False,
+                      selection_scores: Sequence[float] | None = None) -> dict[str, float | int]:
+    """Compute full-distribution router controls before admission.
+
+    ``logits`` define the softmax gate mass. When the checkpoint adds an expert
+    bias before top-K admission, ``selection_scores`` must contain those exact
+    adjusted scores so the admission margin follows executed routing semantics.
+    """
     values = np.asarray(logits, dtype=np.float64).reshape(-1)
     if values.size < 2 or not np.isfinite(values).all():
         raise ValueError("router logits must be finite and include at least two experts")
-    if expert_bias_enabled:
-        raise RuntimeError("expert-bias ranking semantics require a separately audited implementation")
+    if expert_bias_enabled and selection_scores is None:
+        raise RuntimeError("expert-bias routing requires the exact post-bias admission scores")
     if not 1 <= int(k) < values.size:
         raise ValueError("K must leave a K+1 admission boundary")
     shifted = values - values.max()
     exp = np.exp(shifted)
     probs = exp / exp.sum()
-    order = np.argsort(-probs, kind="stable")
+    admission = (np.asarray(selection_scores, dtype=np.float64).reshape(-1)
+                 if selection_scores is not None else probs)
+    if admission.shape != values.shape or not np.isfinite(admission).all():
+        raise ValueError("selection scores must be finite and match the router logits")
+    order = np.argsort(-admission, kind="stable")
     if selected_experts is None:
         chosen = order[:k]
         next_idx = int(order[k])
@@ -36,7 +46,8 @@ def router_statistics(logits: Sequence[float], k: int, *, selected_experts: Sequ
             raise ValueError("no next expert remains")
         next_idx = remaining[0]
     sorted_probs = probs[order]
-    boundary = float(sorted_probs[k - 1] - sorted_probs[k])
+    sorted_admission = admission[order]
+    boundary = float(sorted_admission[k - 1] - sorted_admission[k])
     if boundary < -1e-12:
         raise RuntimeError("sorted router probability margin became negative")
     entropy = float(-(probs * np.log(np.maximum(probs, np.finfo(np.float64).tiny))).sum())

@@ -12,6 +12,44 @@ class VariableKController:
         self.k_counts_cpu = None
         self.layer_pair_counts = []
         self.layer_names = []
+        self.module_names = ()
+        self.observation_context = None
+        self.routing_records = {}
+
+    def set_observation_context(self, *, global_nfe, monitored_positions, monitored_layers,
+                                capture=True):
+        """Enable sparse read-only router capture for exactly the next forward."""
+        if self.enabled:
+            raise RuntimeError("router observation context must be set before begin_forward")
+        self.observation_context = {
+            "global_nfe": int(global_nfe),
+            "monitored_positions": frozenset(int(p) for p in monitored_positions),
+            "monitored_layers": frozenset(int(layer) for layer in monitored_layers),
+            "capture": bool(capture),
+        }
+        self.routing_records = {}
+
+    def record_routing(self, layer_idx, position, module_name, experts, weights,
+                       router_logits, selection_scores, expert_bias_enabled=False):
+        context = self.observation_context
+        if (context is None or not context["capture"] or layer_idx not in context["monitored_layers"]
+                or position not in context["monitored_positions"]):
+            return
+        from .jrc_v4.features import router_statistics
+        logits = router_logits.detach().float().cpu().tolist()
+        selection = selection_scores.detach().float().cpu().tolist()
+        self.routing_records[(int(layer_idx), int(position))] = {
+            "module": str(module_name), "global_nfe": context["global_nfe"],
+            "k": len(experts), "experts": tuple(int(e) for e in experts),
+            "weights": tuple(float(w) for w in weights),
+            "router_logits": tuple(float(v) for v in logits),
+            "selection_scores": tuple(float(v) for v in selection),
+            "expert_bias_enabled": bool(expert_bias_enabled),
+            "router_statistics": router_statistics(
+                logits, len(experts), selected_experts=experts,
+                selection_scores=selection, expert_bias_enabled=expert_bias_enabled,
+            ),
+        }
 
     def begin_forward(self, k_counts):
         k = torch.as_tensor(k_counts, dtype=torch.long).detach().cpu()
@@ -22,6 +60,7 @@ class VariableKController:
         self.k_counts_cpu = k
         self.layer_pair_counts = []
         self.layer_names = []
+        self.routing_records = {}
         self.enabled = True
 
     def record_layer(self, name, pair_count):
@@ -43,11 +82,25 @@ class VariableKController:
             raise RuntimeError(
                 f"Direct pairs {direct} != allocated pairs {expected}"
             )
-        return {
+        result = {
             "direct_pairs": direct,
             "expected_pairs": expected,
             "layer_pair_counts": list(self.layer_pair_counts),
         }
+        if self.observation_context is not None:
+            values = tuple(int(v) for v in self.k_counts_cpu.tolist())
+            result["routing_records"] = dict(self.routing_records)
+            result["k_by_layer"] = tuple(values for _ in range(self.expected_layers))
+            self.observation_context = None
+        return result
+
+    def abort_forward(self):
+        self.enabled = False
+        self.k_counts_cpu = None
+        self.layer_pair_counts = []
+        self.layer_names = []
+        self.routing_records = {}
+        self.observation_context = None
 
 
 
@@ -60,13 +113,15 @@ def install_variable_k_patch(model, controller):
         if hasattr(module, "_reflex_original_forward"):
             module.forward = module._reflex_original_forward
 
-    for name, module in model.named_modules():
-        if module.__class__.__name__ != "LLaDAMoESparseMoeBlock":
-            continue
+    module_names = []
+    moe_modules = [(name, module) for name, module in model.named_modules()
+                   if module.__class__.__name__ == "LLaDAMoESparseMoeBlock"]
+    for layer_idx, (name, module) in enumerate(moe_modules):
+        module_names.append(name)
 
         module._reflex_original_forward = module.forward
 
-        def variable_forward(self, hidden_states, _name=name):
+        def variable_forward(self, hidden_states, _name=name, _layer_idx=layer_idx):
             ctrl = controller
 
             if not ctrl.enabled or ctrl.k_counts_cpu is None:
@@ -117,6 +172,18 @@ def install_variable_k_patch(model, controller):
                 )
 
             selected_weights = selected_weights.to(flat.dtype)
+
+            context = ctrl.observation_context
+            if context is not None and context["capture"] and _layer_idx in context["monitored_layers"]:
+                for position in sorted(context["monitored_positions"]):
+                    k = int(k_counts[position].item())
+                    ctrl.record_routing(
+                        _layer_idx, position, _name,
+                        selected_experts[position, :k].detach().cpu().tolist(),
+                        selected_weights[position, :k].detach().float().cpu().tolist(),
+                        router_logits[position],
+                        full_weights[position], self.expert_bias is not None,
+                    )
 
             expert_mask = F.one_hot(
                 selected_experts,
@@ -169,6 +236,8 @@ def install_variable_k_patch(model, controller):
             module,
         )
         patched.append(name)
+
+    controller.module_names = tuple(module_names)
 
     if len(patched) != NUM_MOE_LAYERS:
         raise RuntimeError(

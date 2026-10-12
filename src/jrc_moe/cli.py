@@ -9,6 +9,9 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "jrc-v4":
         from .jrc_v4.cli import main as v4_main
         return v4_main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "natural":
+        from .natural_cli import main as natural_main
+        return natural_main(sys.argv[2:])
     from .runner import run_experiment
     parser = argparse.ArgumentParser(prog="jrc-moe")
     sub = parser.add_subparsers(dest="command", required=True)
