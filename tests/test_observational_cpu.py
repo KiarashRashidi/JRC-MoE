@@ -234,10 +234,9 @@ class AnalysisPackagingTests(unittest.TestCase):
         self.assertIsNone(_spearman([1, 1], [2, 3]))
 
     def test_empty_analysis_is_blocked_without_empty_figures(self):
-        import os
         import tempfile
         from jrc_moe.natural_analysis import analyze
-        with tempfile.TemporaryDirectory(dir=os.environ["TEMP"]) as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             result = analyze(temporary, config={"study": {"block_length": 32},
                                                 "analysis": {"cluster_bootstrap_draws": 20}})
             self.assertEqual(result["status"], "blocked_no_valid_gpu_trajectories")
@@ -250,7 +249,7 @@ class AnalysisPackagingTests(unittest.TestCase):
         import zipfile
         from pathlib import Path
         from jrc_moe.natural_package import package_review
-        with tempfile.TemporaryDirectory(dir=os.environ["TEMP"]) as temporary:
+        with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "analysis").mkdir()
             (root / "analysis" / "analysis.json").write_text("{}", encoding="utf-8")
