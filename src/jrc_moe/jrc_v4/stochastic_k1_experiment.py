@@ -352,7 +352,7 @@ def _run_one_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
                  seed: int, output_dir: Path) -> dict:
     import torch
     import pandas as pd
-    from ..generation import generate_with_routing_mode, validate_trace, postprocess_generated_region
+    from ..generation import generate_with_routing_mode, postprocess_generated_region
     from ..grading import canonical_grade_text
     from .patch import install_layerwise_patch
 
@@ -394,7 +394,7 @@ def _run_one_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
             allocation_provider=provider, forward_observer=observe,
             checkpoint_revision=config["model"]["revision"], config_digest=config_digest,
         )
-        validate_trace(trace, "fixed8")
+        _validate_stochastic_trace(trace)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             event_end.record()
@@ -442,6 +442,31 @@ def _bootstrap_mean(differences: list[float], *, seed: int, repetitions: int) ->
     return {"mean": float(values.mean()),
             "ci95": [float(x) for x in np.quantile(means, [0.025, 0.975])],
             "n_prompts": int(len(values))}
+
+
+def _validate_stochastic_trace(trace, *, num_blocks: int = 8,
+                               block_length: int = 32) -> None:
+    """Validate complete block refinement without assuming legacy K buckets."""
+    required = {"block_idx", "local_nfe", "global_nfe", "masked_before",
+                "masked_after", "num_committed", "direct_pairs", "forward_mean_k"}
+    if trace.empty or not required.issubset(trace.columns):
+        raise RuntimeError("policy rollout trace is empty or missing required fields")
+    if set(int(x) for x in trace["block_idx"].unique()) != set(range(num_blocks)):
+        raise RuntimeError("policy rollout did not visit every decoding block")
+    if not trace["global_nfe"].is_monotonic_increasing:
+        raise RuntimeError("global NFE is not monotonic in the policy rollout")
+    if (trace["direct_pairs"] <= 0).any():
+        raise RuntimeError("policy rollout has a forward with no executed expert-token pairs")
+    if not trace["forward_mean_k"].between(1.0, 8.0, inclusive="both").all():
+        raise RuntimeError("policy rollout allocation is outside K=1..8")
+    for block_idx in range(num_blocks):
+        group = trace[trace["block_idx"] == block_idx].sort_values("local_nfe")
+        if int(group["num_committed"].sum()) != block_length:
+            raise RuntimeError(f"block {block_idx} did not commit exactly {block_length} tokens")
+        if not (group["masked_after"] < group["masked_before"]).all():
+            raise RuntimeError(f"block {block_idx} had a refinement forward with no progress")
+        if int(group.iloc[-1]["masked_after"]) != 0:
+            raise RuntimeError(f"block {block_idx} ended with unresolved masks")
 
 
 def _summarize(rows: list[dict], config: dict) -> dict:

@@ -2,6 +2,9 @@ from jrc_moe.jrc_v4.stochastic_k1_policy import (
     build_sparse_k1_plan,
     confidence_probability,
 )
+from jrc_moe.jrc_v4.stochastic_k1_experiment import _validate_stochastic_trace
+import pandas as pd
+import pytest
 
 
 def test_k1_probability_is_bounded_and_decreases_with_confidence():
@@ -51,3 +54,16 @@ def test_matched_random_arm_uses_forward_mean_rate_and_same_draws():
     assert all(rm["selected"][i]["selection_probability"] == expected_mean
                for i in range(len(rm["selected"])))
     assert len(weighted) == len(random_plan) == 16
+
+
+def test_policy_trace_requires_complete_progress_in_all_blocks():
+    trace = pd.DataFrame([
+        {"block_idx": block, "local_nfe": 1, "global_nfe": block + 1,
+         "masked_before": 32, "masked_after": 0, "num_committed": 32,
+         "direct_pairs": 1000, "forward_mean_k": 7.9}
+        for block in range(8)
+    ])
+    _validate_stochastic_trace(trace)
+    trace.loc[0, "masked_after"] = 32
+    with pytest.raises(RuntimeError, match="no progress"):
+        _validate_stochastic_trace(trace)
