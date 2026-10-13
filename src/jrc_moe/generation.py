@@ -236,6 +236,7 @@ def generate_with_routing_mode(
                     "masked_before": masked_before,
                     "confidence_history": copy.deepcopy(confidence_history),
                     "k_by_layer": pair_meta["k_by_layer"],
+                    "allocation_meta": fger_meta,
                     "routing_records": pair_meta["routing_records"],
                 })
             if sensitivity_observer is not None:
