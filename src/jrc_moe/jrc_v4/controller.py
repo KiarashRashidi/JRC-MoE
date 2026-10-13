@@ -63,6 +63,7 @@ class LayerwiseKController:
         self._route_records: dict[tuple[int, int], dict] = {}
         self.capture_expert_contributions = False
         self.mass_mode = False
+        self._mass_summary: dict | None = None
 
     @property
     def sequence_length(self) -> int | None:
@@ -125,6 +126,10 @@ class LayerwiseKController:
         self._observed_layer_pairs = [None] * len(self.module_names)
         self._override_fires = 0
         self._route_records = {}
+        self._mass_summary = ({"expert_count_histogram": {}, "target_mass_histogram": {},
+                               "achieved_mass_sum": 0.0, "achieved_mass_min": 1.0,
+                               "achieved_mass_max": 0.0, "mass_target_violations": 0,
+                               "token_count": 0} if mass_mode else None)
         self.enabled = True
 
     def for_layer(self, layer_idx: int, module_name: str, sequence_length: int) -> tuple[int, ...]:
@@ -164,6 +169,27 @@ class LayerwiseKController:
         if len(values) != len(self._actual[layer_idx]) or any(v < 1 or v > 64 for v in values):
             raise ValueError("resolved K counts are outside the sequence/expert bounds")
         self._actual[layer_idx] = list(values)
+
+    def record_mass_routing(self, layer_idx: int, target_masses: Sequence[float],
+                            achieved_masses: Sequence[float]) -> None:
+        """Aggregate realized mass and expert counts without retaining token logits."""
+        if not self.enabled or not self.mass_mode or self._mass_summary is None:
+            raise RuntimeError("mass statistics require an active mass-routed forward")
+        targets = [float(v) for v in target_masses]
+        masses = [float(v) for v in achieved_masses]
+        counts = self._actual[layer_idx]
+        if len(targets) != len(masses) or len(masses) != len(counts):
+            raise ValueError("mass audit vectors differ in length")
+        summary = self._mass_summary
+        for target, mass, count in zip(targets, masses, counts):
+            k_key, p_key = str(count), f"{target:.1f}"
+            summary["expert_count_histogram"][k_key] = summary["expert_count_histogram"].get(k_key, 0) + 1
+            summary["target_mass_histogram"][p_key] = summary["target_mass_histogram"].get(p_key, 0) + 1
+            summary["achieved_mass_sum"] += mass
+            summary["achieved_mass_min"] = min(summary["achieved_mass_min"], mass)
+            summary["achieved_mass_max"] = max(summary["achieved_mass_max"], mass)
+            summary["mass_target_violations"] += int(mass + 5e-4 < target)
+            summary["token_count"] += 1
 
     def record_routing(self, layer_idx: int, position: int, experts: Sequence[int], weights: Sequence[float],
                        *, router_logits: Sequence[float] | None = None, hidden_state_norm: float | None = None) -> None:
@@ -262,6 +288,7 @@ class LayerwiseKController:
             "position_deltas": tuple(getattr(ex, "position_deltas", ())) if ex else (),
             "action_digest": getattr(ex, "action_digest", None) if ex else None,
             "routing_records": dict(self._route_records),
+            "mass_summary": self._mass_summary,
         }
         self.enabled = False
         self._plan = None
@@ -275,3 +302,4 @@ class LayerwiseKController:
         self._calls = []
         self._observed_layer_pairs = []
         self._route_records = {}
+        self._mass_summary = None

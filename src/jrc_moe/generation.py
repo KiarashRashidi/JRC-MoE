@@ -238,6 +238,7 @@ def generate_with_routing_mode(
                     "k_by_layer": pair_meta["k_by_layer"],
                     "allocation_meta": fger_meta,
                     "routing_records": pair_meta["routing_records"],
+                    "mass_summary": pair_meta.get("mass_summary"),
                 })
             if sensitivity_observer is not None:
                 active_logits = outputs.logits[0, unresolved_abs, :]

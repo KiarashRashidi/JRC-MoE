@@ -87,6 +87,11 @@ def install_layerwise_patch(model: Any, controller: LayerwiseKController,
                 selected_weights, selected_experts = torch.topk(full_probs, max_k, dim=-1)
             ranks = torch.arange(max_k, device=flat.device).unsqueeze(0)
             active_rank = ranks < k_counts.unsqueeze(1)
+            if controller.mass_mode:
+                resolved_mass = (selected_weights * active_rank).sum(dim=1)
+                controller.record_mass_routing(
+                    _layer_idx, allocation_values,
+                    resolved_mass.detach().float().cpu().tolist())
             selected_weights = selected_weights * active_rank
             selected_weights = selected_weights.to(flat.dtype)
 

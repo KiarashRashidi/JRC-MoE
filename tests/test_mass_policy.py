@@ -5,6 +5,7 @@ from jrc_moe.jrc_v4.mass_policy import (
     build_mass_plan,
     experts_for_cumulative_mass,
 )
+from jrc_moe.jrc_v4.controller import LayerwiseKController
 
 
 def test_low_and_high_confidence_extremes_reverse_probabilities():
@@ -42,3 +43,17 @@ def test_cumulative_router_mass_uses_shortest_prefix():
 def test_mass_inputs_reject_invalid_probability_vectors():
     with pytest.raises(ValueError):
         experts_for_cumulative_mass([.5, .3], .9)
+
+
+def test_controller_accounts_for_resolved_k_and_achieved_mass():
+    controller = LayerwiseKController(("moe.0",), min_k=1, max_k=64)
+    controller.begin_forward([[.6, .1]], global_nfe=1)
+    assert controller.for_layer(0, "moe.0", 2) == (.6, .1)
+    controller.record_resolved_k(0, [2, 1])
+    controller.record_mass_routing(0, [.6, .1], [.8, .5])
+    controller.record_layer_pairs(0, "moe.0", 3)
+    result = controller.end_forward()
+    assert result["direct_pairs"] == 3
+    assert result["mass_summary"]["expert_count_histogram"] == {"2": 1, "1": 1}
+    assert result["mass_summary"]["achieved_mass_sum"] == pytest.approx(1.3)
+    assert result["mass_summary"]["mass_target_violations"] == 0

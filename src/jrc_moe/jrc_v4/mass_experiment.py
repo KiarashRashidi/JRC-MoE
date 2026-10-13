@@ -77,7 +77,6 @@ def _mass_forward_gate(runtime: dict, config: dict) -> dict:
     from torch.nn import functional as F
     from .controller import LayerwiseKController
     from .patch import install_layerwise_patch
-    from .mass_policy import experts_for_cumulative_mass
 
     model = runtime["model"]
     names = runtime["names"]
@@ -107,12 +106,20 @@ def _mass_forward_gate(runtime: dict, config: dict) -> dict:
             raise RuntimeError("P=.6 mass forward produced nonfinite logits or no route records")
         if any(mass + 5e-4 < target for mass in masses):
             raise RuntimeError("actual selected router mass fell below its P target")
+        mass_summary = result["mass_summary"]
+        if mass_summary["mass_target_violations"]:
+            raise RuntimeError("one or more GPU-routed tokens failed to reach the requested cumulative mass")
         return {"passed": True, "target_mass": target,
                 "recorded_tokens": len(route_counts),
                 "mean_experts_at_p06": sum(route_counts) / len(route_counts),
                 "max_experts_at_p06": max(route_counts),
                 "mean_achieved_mass": sum(masses) / len(masses),
                 "min_achieved_mass": min(masses),
+                "all_layer_token_count": int(mass_summary["token_count"]),
+                "all_layer_mean_experts": sum(int(k) * int(v) for k, v in
+                    mass_summary["expert_count_histogram"].items()) / int(mass_summary["token_count"]),
+                "all_layer_mean_achieved_mass": mass_summary["achieved_mass_sum"] / mass_summary["token_count"],
+                "all_layer_expert_count_histogram": mass_summary["expert_count_histogram"],
                 "finite_logits": True,
                 "router_mass_accounting_checks": len(checked)}
     finally:
@@ -197,7 +204,8 @@ def _run_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
         meta = payload.get("allocation_meta") or {}
         policy_rows.append({"prompt_id": prompt_id, "arm": arm,
                             "block_idx": payload["block_idx"], "global_nfe": payload["global_nfe"],
-                            "unresolved_positions": len(payload["unresolved_positions"]), **meta})
+                            "unresolved_positions": len(payload["unresolved_positions"]),
+                            "mass_summary": payload.get("mass_summary"), **meta})
         selected.extend({**event, "prompt_id": prompt_id, "arm": arm,
                          "block_idx": payload["block_idx"], "global_nfe": payload["global_nfe"]}
                         for event in meta.get("selected", []))
@@ -288,6 +296,14 @@ def _summarize(rows: list[dict], config: dict) -> dict:
                            max(1, sum(r["arm"] == arm for r in rows)),
                            "mean_avg_k": sum(r["avg_k"] for r in rows if r["arm"] == arm) /
                            max(1, sum(r["arm"] == arm for r in rows)),
+                           "mean_realized_experts_per_token": sum(r.get("mass_summary", {}).get("expert_count_sum", 0) /
+                               max(1, r.get("mass_summary", {}).get("token_count", 0)) for r in rows if r["arm"] == arm) /
+                               max(1, sum(r["arm"] == arm for r in rows)),
+                           "mean_achieved_router_mass": sum(r.get("mass_summary", {}).get("achieved_mass_sum", 0) /
+                               max(1, r.get("mass_summary", {}).get("token_count", 0)) for r in rows if r["arm"] == arm) /
+                               max(1, sum(r["arm"] == arm for r in rows)),
+                           "mass_target_violations": sum(r.get("mass_summary", {}).get("mass_target_violations", 0)
+                               for r in rows if r["arm"] == arm),
                            "mean_total_pairs": sum(r["total_pairs"] for r in rows if r["arm"] == arm) /
                            max(1, sum(r["arm"] == arm for r in rows)),
                            "mean_wall_seconds": sum(r["wall_seconds"] for r in rows if r["arm"] == arm) /
@@ -373,7 +389,20 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                 result["historical_fixed8_correct"] = int(audit["baseline_correct_strata"][str(pid)])
                 policy_rows = result["policy_rows"]
                 result["policy_summary"] = []
+                aggregate_mass = {"token_count": 0, "expert_count_sum": 0,
+                                  "achieved_mass_sum": 0.0, "mass_target_violations": 0,
+                                  "expert_count_histogram": {}, "target_mass_histogram": {}}
                 for forward in policy_rows:
+                    mass = forward.get("mass_summary") or {}
+                    aggregate_mass["token_count"] += int(mass.get("token_count", 0))
+                    aggregate_mass["expert_count_sum"] += sum(
+                        int(k) * int(count) for k, count in mass.get("expert_count_histogram", {}).items())
+                    aggregate_mass["achieved_mass_sum"] += float(mass.get("achieved_mass_sum", 0.0))
+                    aggregate_mass["mass_target_violations"] += int(mass.get("mass_target_violations", 0))
+                    for key, value in mass.get("expert_count_histogram", {}).items():
+                        aggregate_mass["expert_count_histogram"][key] = aggregate_mass["expert_count_histogram"].get(key, 0) + int(value)
+                    for key, value in mass.get("target_mass_histogram", {}).items():
+                        aggregate_mass["target_mass_histogram"][key] = aggregate_mass["target_mass_histogram"].get(key, 0) + int(value)
                     counts = {band: {"p01": 0, "p09": 0} for band in ("low", "middle", "high")}
                     for event in forward.get("selected", []):
                         counts[event["confidence_band"]]["p01" if event["target_mass"] == .1 else "p09"] += 1
@@ -381,6 +410,7 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                         "exposures_by_confidence_band": forward.get("exposures_by_confidence_band", {}),
                         "assignments_by_band": counts,
                         "assignments_by_mass": forward.get("assignments_by_mass", {})})
+                result["mass_summary"] = aggregate_mass
                 if result["cuda_event_seconds"] is not None:
                     ledger.add_gpu_time(result["cuda_event_seconds"])
                 for forward in result.pop("policy_rows"):
