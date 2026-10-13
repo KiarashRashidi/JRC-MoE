@@ -535,6 +535,18 @@ def _summarize(rows: list[dict], config: dict) -> dict:
     }
 
 
+def _aggregate_policy_exposure(forward_rows: list[dict]) -> tuple[dict, dict]:
+    """Retain the confidence-band opportunity and selection totals per branch."""
+    bands = ("low", "middle", "high")
+    exposures = {band: 0 for band in bands}
+    selected = {band: 0 for band in bands}
+    for row in forward_rows:
+        for band in bands:
+            exposures[band] += int(row.get("exposures_by_confidence_band", {}).get(band, 0))
+            selected[band] += int(row.get("k1_assignments_by_confidence_band", {}).get(band, 0))
+    return exposures, selected
+
+
 def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
               output_dir: Path, resume: bool = False) -> dict:
     import torch
@@ -631,6 +643,9 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                     row["historical_fixed8_correct_for_stratum"] = int(audit["baseline_correct_strata"][prompt_key])
                     if row["cuda_event_seconds"] is not None:
                         ledger.add_gpu_time(row["cuda_event_seconds"])
+                    (row["exposures_by_confidence_band"],
+                     row["k1_assignments_by_confidence_band"]) = _aggregate_policy_exposure(
+                         row["policy_rows"])
                     for forward in row.pop("policy_rows"):
                         _append_jsonl(output_dir / "forward_policy_summaries.jsonl", forward)
                     for event in row.pop("selected_events"):

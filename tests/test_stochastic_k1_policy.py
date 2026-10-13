@@ -2,7 +2,10 @@ from jrc_moe.jrc_v4.stochastic_k1_policy import (
     build_sparse_k1_plan,
     confidence_probability,
 )
-from jrc_moe.jrc_v4.stochastic_k1_experiment import _validate_stochastic_trace
+from jrc_moe.jrc_v4.stochastic_k1_experiment import (
+    _aggregate_policy_exposure,
+    _validate_stochastic_trace,
+)
 import pandas as pd
 import pytest
 
@@ -67,3 +70,14 @@ def test_policy_trace_requires_complete_progress_in_all_blocks():
     trace.loc[0, "masked_after"] = 32
     with pytest.raises(RuntimeError, match="no progress"):
         _validate_stochastic_trace(trace)
+
+
+def test_branch_summary_retains_policy_exposure_counts():
+    exposures, selected = _aggregate_policy_exposure([
+        {"exposures_by_confidence_band": {"low": 10, "middle": 5, "high": 2},
+         "k1_assignments_by_confidence_band": {"low": 2, "middle": 1, "high": 0}},
+        {"exposures_by_confidence_band": {"low": 4, "middle": 3, "high": 1},
+         "k1_assignments_by_confidence_band": {"low": 1, "middle": 0, "high": 1}},
+    ])
+    assert exposures == {"low": 14, "middle": 8, "high": 3}
+    assert selected == {"low": 3, "middle": 1, "high": 1}
