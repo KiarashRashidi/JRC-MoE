@@ -1,0 +1,56 @@
+protocol_version: jrc-v4-confidence-router-mass-1
+model:
+  id: inclusionAI/LLaDA-MoE-7B-A1B-Instruct
+  revision: 783d3467f108d28ac0a78d3e41af16ab05cabd8d
+  num_layers: 16
+  num_experts: 64
+  native_top_k: 8
+dataset:
+  name: gsm8k
+  historical_fixed8_csv: data/diagnostic_50_results.csv
+  few_shot: 5
+  few_shot_seed: 1234
+  prompt_selection_seed: 20261013
+  prompts: 10
+  baseline_correct_prompts: 5
+  baseline_incorrect_prompts: 5
+decoder:
+  generation_length: 256
+  block_length: 32
+  confidence_threshold: 0.90
+  commit_policy: threshold_with_argmax_fallback
+  baseline_k: 8
+policy:
+  candidate_scope: unresolved_tokens_in_active_32_token_block
+  apply_at: every_moe_layer_and_decoder_forward
+  assignments_independent_per_token_layer_pair: true
+  confidence_source: latest_pre_forward_reflex_max_softmax_probability
+  missing_confidence_action: retain_base_mass_0_6
+  base_mass: 0.6
+  low_mass: 0.1
+  high_mass: 0.9
+  low_confidence_boundary: 0.50
+  high_confidence_boundary: 0.90
+  low_confidence_p_low: 0.50
+  high_confidence_p_low: 0.02
+  high_confidence_p_high: 0.50
+  low_confidence_p_high: 0.02
+  probability_interpolation: linear_mirror
+  arms: [fixed_p06, confidence_adaptive]
+  fixed_arm_applies_p06_to_all_tokens: true
+  adaptive_arm_unresolved_tokens_without_history_use_p06: true
+  cumulative_mass_rule: smallest_top_ranked_prefix_whose_original_softmax_gate_weights_sum_to_at_least_target
+  preserve_original_unnormalized_selected_weights: true
+statistics:
+  bootstrap_unit: prompt
+  bootstrap_resamples: 10000
+  bootstrap_seed: 20261013
+resources:
+  gpu_count: 1
+  max_gpu_hours: 3
+  max_wall_hours: 3
+  max_branches: 40
+  max_prompts: 10
+  max_output_gb: 2
+  branch_reserve_gpu_seconds: 600
+  output_root: outputs/jrc_v4_router_mass

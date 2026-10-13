@@ -62,6 +62,7 @@ class LayerwiseKController:
         self._override_fires = 0
         self._route_records: dict[tuple[int, int], dict] = {}
         self.capture_expert_contributions = False
+        self.mass_mode = False
 
     @property
     def sequence_length(self) -> int | None:
@@ -80,12 +81,19 @@ class LayerwiseKController:
             raise ValueError("K plan must be [position] or [layer, position]")
         width = len(rows[0])
         matrix = []
+        flat_values = [value for row in rows for value in row]
+        mass_mode = bool(flat_values) and all(isinstance(value, float) for value in flat_values)
         for row in rows:
             if len(row) != width:
                 raise ValueError("all layer K rows must have the same sequence length")
-            values = tuple(int(v) for v in row)
-            if any(v < self.min_k or v > self.max_k for v in values):
-                raise ValueError(f"K plan values must be in [{self.min_k}, {self.max_k}]")
+            if mass_mode:
+                values = tuple(float(v) for v in row)
+                if any(not 0.0 < v <= 1.0 for v in values):
+                    raise ValueError("mass plan values must be in (0, 1]")
+            else:
+                values = tuple(int(v) for v in row)
+                if any(v < self.min_k or v > self.max_k for v in values):
+                    raise ValueError(f"K plan values must be in [{self.min_k}, {self.max_k}]")
             matrix.append(values)
         if global_nfe < 1:
             raise ValueError("global_nfe is one-based and must be positive")
@@ -108,7 +116,8 @@ class LayerwiseKController:
         if branch == "treatment" and exchange is None:
             raise ValueError("treatment branch requires an exchange")
         self._plan = tuple(matrix)
-        self._actual = [list(row) for row in matrix]
+        self.mass_mode = mass_mode
+        self._actual = [[0] * len(row) for row in matrix] if mass_mode else [list(row) for row in matrix]
         self._global_nfe = int(global_nfe)
         self._branch = branch
         self._exchange = exchange
@@ -145,7 +154,16 @@ class LayerwiseKController:
                     raise ValueError("exchange adjustment violates K bounds at application time")
                 self._actual[layer_idx][position] = adjusted
             self._override_fires += 1
-        return tuple(self._actual[layer_idx])
+        return tuple(self._plan[layer_idx] if self.mass_mode else self._actual[layer_idx])
+
+    def record_resolved_k(self, layer_idx: int, k_values: Sequence[int]) -> None:
+        """Store per-token K selected from a mass target inside the router patch."""
+        if not self.enabled or not self.mass_mode or not 0 <= layer_idx < len(self.module_names):
+            raise RuntimeError("resolved K counts require an active mass-routed forward")
+        values = tuple(int(v) for v in k_values)
+        if len(values) != len(self._actual[layer_idx]) or any(v < 1 or v > 64 for v in values):
+            raise ValueError("resolved K counts are outside the sequence/expert bounds")
+        self._actual[layer_idx] = list(values)
 
     def record_routing(self, layer_idx: int, position: int, experts: Sequence[int], weights: Sequence[float],
                        *, router_logits: Sequence[float] | None = None, hidden_state_norm: float | None = None) -> None:

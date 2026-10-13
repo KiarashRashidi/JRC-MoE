@@ -67,12 +67,24 @@ def install_layerwise_patch(model: Any, controller: LayerwiseKController,
             if batch_size != 1:
                 raise RuntimeError("JRC-v4 intervention patch requires batch size 1")
             flat = hidden_states.reshape(-1, hidden_dim)
-            k_values = controller.for_layer(_layer_idx, _name, flat.shape[0])
-            k_counts = torch.as_tensor(k_values, dtype=torch.long, device=flat.device)
-            max_k = int(k_counts.max().item())
+            allocation_values = controller.for_layer(_layer_idx, _name, flat.shape[0])
             router_logits = self.gate(flat)
             full_probs = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            selected_weights, selected_experts = torch.topk(full_probs, max_k, dim=-1)
+            if controller.mass_mode:
+                targets = torch.as_tensor(allocation_values, dtype=torch.float32, device=flat.device)
+                all_weights, all_experts = torch.topk(full_probs, contract.num_experts, dim=-1)
+                cumulative = all_weights.cumsum(dim=-1)
+                reached = cumulative >= targets.unsqueeze(1)
+                # Every softmax row reaches any P <= 1; argmax returns the first true index.
+                k_counts = reached.to(torch.int64).argmax(dim=1) + 1
+                controller.record_resolved_k(_layer_idx, k_counts.detach().cpu().tolist())
+                max_k = int(k_counts.max().item())
+                selected_weights = all_weights[:, :max_k]
+                selected_experts = all_experts[:, :max_k]
+            else:
+                k_counts = torch.as_tensor(allocation_values, dtype=torch.long, device=flat.device)
+                max_k = int(k_counts.max().item())
+                selected_weights, selected_experts = torch.topk(full_probs, max_k, dim=-1)
             ranks = torch.arange(max_k, device=flat.device).unsqueeze(0)
             active_rank = ranks < k_counts.unsqueeze(1)
             selected_weights = selected_weights * active_rank
