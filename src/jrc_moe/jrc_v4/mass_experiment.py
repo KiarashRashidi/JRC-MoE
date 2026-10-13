@@ -30,6 +30,27 @@ def _read(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _validate_mass_trace(trace, *, num_blocks: int = 8, block_length: int = 32) -> None:
+    required = {"block_idx", "local_nfe", "global_nfe", "masked_before",
+                "masked_after", "num_committed", "direct_pairs", "forward_mean_k"}
+    if trace.empty or not required.issubset(trace.columns):
+        raise RuntimeError("mass-policy rollout trace is empty or incomplete")
+    if set(int(x) for x in trace["block_idx"].unique()) != set(range(num_blocks)):
+        raise RuntimeError("mass-policy rollout did not visit every decoder block")
+    if not trace["global_nfe"].is_monotonic_increasing or (trace["direct_pairs"] <= 0).any():
+        raise RuntimeError("mass-policy trace has invalid NFE order or zero expert-token pairs")
+    if (trace["forward_mean_k"] < 1.0).any():
+        raise RuntimeError("mass-policy trace contains an invalid expert count")
+    for block_idx in range(num_blocks):
+        group = trace[trace["block_idx"] == block_idx].sort_values("local_nfe")
+        if int(group["num_committed"].sum()) != block_length:
+            raise RuntimeError(f"decoder block {block_idx} did not commit {block_length} tokens")
+        if not (group["masked_after"] < group["masked_before"]).all():
+            raise RuntimeError(f"decoder block {block_idx} had a refinement step without progress")
+        if int(group.iloc[-1]["masked_after"]) != 0:
+            raise RuntimeError(f"decoder block {block_idx} ended with unresolved masks")
+
+
 def _config(path: Path) -> dict:
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -223,8 +244,7 @@ def _run_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
             model, prompt_ids, "fixed8", controller, allocation_provider=provider,
             forward_observer=observe, checkpoint_revision=config["model"]["revision"],
             config_digest=config_digest)
-        if trace.empty or int(trace["block_idx"].nunique()) != 8:
-            raise RuntimeError("rollout did not complete all eight decoding blocks")
+        _validate_mass_trace(trace)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             end_event.record()
