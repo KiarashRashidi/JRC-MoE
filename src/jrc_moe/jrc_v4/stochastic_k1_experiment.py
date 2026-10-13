@@ -41,7 +41,10 @@ def _read_jsonl(path: Path) -> list[dict]:
 def _config(path: Path) -> dict:
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("protocol_version") != "jrc-v4-stochastic-sparse-k1-1":
+    if not isinstance(raw, dict) or raw.get("protocol_version") not in {
+        "jrc-v4-stochastic-sparse-k1-1",
+        "jrc-v4-stochastic-sparse-k1-2",
+    }:
         raise ValueError("unexpected stochastic K=1 protocol config")
     policy = raw["policy"]
     if policy["missing_confidence_action"] != "retain_k8":

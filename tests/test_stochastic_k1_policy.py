@@ -16,6 +16,12 @@ def test_k1_probability_is_bounded_and_decreases_with_confidence():
     assert all(a >= b for a, b in zip(values, values[1:]))
 
 
+def test_fifty_percent_policy_interpolates_to_two_percent():
+    values = [confidence_probability(x, low_probability=0.50, high_probability=0.02)
+              for x in (0.0, 0.5, 0.7, 0.9, 1.0)]
+    assert [round(x, 8) for x in values] == [0.50, 0.50, 0.26, 0.02, 0.02]
+
+
 def test_missing_history_leaves_all_positions_at_k8():
     plan, meta = build_sparse_k1_plan(
         sequence_length=5, num_layers=3, unresolved_positions=(1, 2),
