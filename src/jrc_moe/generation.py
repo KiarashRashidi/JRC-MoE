@@ -352,19 +352,19 @@ def generate_with_routing_mode(
                 "k14_count": k_hist.get(14, 0),
                 "fger_rankable_count": (
                     None if fger_meta is None
-                    else fger_meta["rankable_count"]
+                    else fger_meta.get("rankable_count")
                 ),
                 "fger_group_size": (
                     None if fger_meta is None
-                    else fger_meta["group_size"]
+                    else fger_meta.get("group_size")
                 ),
                 "fger_high_count": (
                     0 if fger_meta is None
-                    else len(fger_meta["high_positions"])
+                    else len(fger_meta.get("high_positions", []))
                 ),
                 "fger_low_count": (
                     0 if fger_meta is None
-                    else len(fger_meta["low_positions"])
+                    else len(fger_meta.get("low_positions", []))
                 ),
                 "forward_seconds": forward_seconds,
             })
