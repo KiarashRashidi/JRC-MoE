@@ -10,6 +10,18 @@ from .config import *
 from .model import input_device as resolve_input_device
 from .routing import allocation_for_forward
 
+
+def _effective_k_by_layer(pair_meta, requested_k, num_layers):
+    """Normalize legacy shared-K and v4 layerwise controller accounting."""
+    actual = pair_meta.get("k_by_layer")
+    if actual is not None:
+        return actual
+    counts = torch.as_tensor(requested_k, dtype=torch.long).detach().cpu()
+    if counts.ndim != 1:
+        raise RuntimeError("legacy REFLEX controller requires a one-dimensional K allocation")
+    row = tuple(int(value) for value in counts.tolist())
+    return tuple(row for _ in range(int(num_layers)))
+
 def extract_target_predictions_and_confidence(
     logits,
     prompt_len,
@@ -236,6 +248,9 @@ def generate_with_routing_mode(
             pair_meta = controller.end_forward()
             direct_pairs = int(pair_meta["direct_pairs"])
             total_pairs += direct_pairs
+            actual_k_by_layer = _effective_k_by_layer(
+                pair_meta, k_counts, NUM_MOE_LAYERS,
+            )
 
             # Router features are pre-admission records from the patched block;
             # post-forward logits are exposed through a separate sensitivity hook
@@ -246,9 +261,9 @@ def generate_with_routing_mode(
                     "unresolved_positions": tuple(unresolved_abs),
                     "masked_before": masked_before,
                     "confidence_history": copy.deepcopy(confidence_history),
-                    "k_by_layer": pair_meta["k_by_layer"],
+                    "k_by_layer": actual_k_by_layer,
                     "allocation_meta": fger_meta,
-                    "routing_records": pair_meta["routing_records"],
+                    "routing_records": pair_meta.get("routing_records", {}),
                     "mass_summary": pair_meta.get("mass_summary"),
                 })
             if sensitivity_observer is not None:
@@ -319,7 +334,7 @@ def generate_with_routing_mode(
             # In cumulative-mass mode, k_counts is the requested P threshold,
             # not a number of experts. The controller exposes the realized
             # expert count for each layer/position after the router resolves P.
-            k_tensor = torch.as_tensor(pair_meta["k_by_layer"], dtype=torch.long)
+            k_tensor = torch.as_tensor(actual_k_by_layer, dtype=torch.long)
             vals, freq = torch.unique(
                 k_tensor,
                 return_counts=True,

@@ -43,3 +43,14 @@ def test_config_rejects_generation_lengths_not_aligned_to_decoder_blocks():
     with pytest.raises(ValueError, match="positive multiple of 32"):
         validate_config(config)
 
+
+def test_legacy_reflex_controller_k_is_expanded_for_per_layer_trace_accounting():
+    pytest.importorskip("transformers")
+    import torch
+    from jrc_moe.generation import _effective_k_by_layer
+
+    shared_k = torch.tensor([8, 8, 6, 6])
+    assert _effective_k_by_layer({}, shared_k, 2) == ((8, 8, 6, 6), (8, 8, 6, 6))
+    layerwise = ((8, 7, 6), (8, 6, 5))
+    assert _effective_k_by_layer({"k_by_layer": layerwise}, shared_k, 2) == layerwise
+
