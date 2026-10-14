@@ -229,7 +229,8 @@ def run_audit(*, root: Path, config_path: Path, output_dir: Path) -> dict:
             "git_branch": __import__("subprocess").run(["git", "-C", str(root), "branch", "--show-current"],
                                  check=True, capture_output=True, text=True).stdout.strip(),
             "checkpoint": f'{raw["model"]["id"]}@{raw["model"]["revision"]}',
-            "prompt_ids": runtime["ids"], "router_semantics": runtime["semantic_evidence"],
+            "prompt_ids": runtime["ids"], "baseline_correct_strata": runtime["strata"],
+            "router_semantics": runtime["semantic_evidence"],
             "native_fixed8_parity": runtime["fixed8_parity"],
             "mass_forward_gate": gate, "allocation_replay_equal": True,
             "environment": collect_environment(root),
@@ -509,6 +510,10 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                     failures.append(failure)
                     attempted.add(key)
                     continue
+                if result["cuda_event_seconds"] is not None:
+                    # Persist actual device time immediately after the expensive
+                    # rollout, even if later grading or artifact serialization fails.
+                    ledger.add_gpu_time(result["cuda_event_seconds"])
                 grade = canonical_grade_text(result["clean_text"], records[pid]["gold_full_answer"])
                 result["canonical_correct"] = int(grade["canonical_correct"])
                 result["canonical_prediction"] = grade.get("prediction")
@@ -545,8 +550,6 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                         "assignments_by_band": counts,
                         "assignments_by_mass": forward.get("assignments_by_mass", {})})
                 result["mass_summary"] = aggregate_mass
-                if result["cuda_event_seconds"] is not None:
-                    ledger.add_gpu_time(result["cuda_event_seconds"])
                 for forward in result.pop("policy_rows"):
                     _append(output_dir / "forward_policy_summaries.jsonl", forward)
                 for event in result.pop("selected_events"):
