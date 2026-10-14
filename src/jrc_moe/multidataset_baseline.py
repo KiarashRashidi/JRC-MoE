@@ -339,7 +339,7 @@ def _write_summary(output_dir: Path, rows):
         writer.writerows(summary)
 
 
-def run(config_path: str | Path, output_dir: str | Path, repo_root: str | Path):
+def run(config_path: str | Path, output_dir: str | Path, repo_root: str | Path, *, smoke: bool = False):
     import torch
     from .config import MODE_REFLEX, NUM_MOE_LAYERS
     from .generation import generate_with_routing_mode, postprocess_generated_region, validate_trace
@@ -351,6 +351,8 @@ def run(config_path: str | Path, output_dir: str | Path, repo_root: str | Path):
     if not (output_dir / "cases.jsonl").is_file() or not (output_dir / "manifest.json").is_file():
         prepare(config_path, output_dir, repo_root)
     cases = _load_cases(output_dir / "cases.jsonl")
+    if smoke:
+        cases = [next(case for case in cases if case["dataset"] == name) for name in DATASET_ORDER]
     config_bytes = config_path.read_bytes()
     config = yaml.safe_load(config_bytes)
     saved_manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
@@ -483,12 +485,13 @@ def main(argv=None):
     parser.add_argument("--config", default="configs/reflex_multidataset_40.yaml")
     parser.add_argument("--output-dir", default="outputs/reflex_multidataset_40")
     parser.add_argument("--repo-root", default=".")
+    parser.add_argument("--smoke", action="store_true", help="run one resumable example from each dataset")
     args = parser.parse_args(argv)
     if args.stage == "prepare":
         manifest = prepare(args.config, args.output_dir, args.repo_root)
         print(json.dumps({"status": manifest["status"], "cases": manifest["total_cases"], "datasets": manifest["dataset_counts"]}, indent=2))
         return manifest
-    return run(args.config, args.output_dir, args.repo_root)
+    return run(args.config, args.output_dir, args.repo_root, smoke=args.smoke)
 
 
 if __name__ == "__main__":

@@ -28,6 +28,9 @@ pip install -e '.[math-eval]'
 python -m jrc_moe.multidataset_baseline --stage prepare \
   --config configs/reflex_multidataset_40.yaml \
   --output-dir outputs/reflex_multidataset_40
+python -m jrc_moe.multidataset_baseline --stage run --smoke \
+  --config configs/reflex_multidataset_40.yaml \
+  --output-dir outputs/reflex_multidataset_40
 python -m jrc_moe.multidataset_baseline --stage run \
   --config configs/reflex_multidataset_40.yaml \
   --output-dir outputs/reflex_multidataset_40
