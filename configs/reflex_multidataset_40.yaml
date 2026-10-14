@@ -1,0 +1,54 @@
+experiment:
+  name: reflex_multidataset_baseline_40
+  description: One REFLEX full rollout for each of 10 deterministic samples per dataset.
+  mode: reflex
+  protocol_version: 1
+selection_seed: 20261014
+model:
+  id: inclusionAI/LLaDA-MoE-7B-A1B-Instruct
+  revision: 783d3467f108d28ac0a78d3e41af16ab05cabd8
+decoder:
+  block_length: 32
+  reflex_confidence_threshold: 0.90
+  commit_policy: threshold_with_argmax_fallback
+datasets:
+  gsm8k:
+    count: 10
+    candidate_csv: data/diagnostic_50_results.csv
+    selection: deterministic_hash_sample_from_historical_50
+    generation_length: 256
+    fewshot: 5
+    grader: canonical_numeric_v1.0.2
+    stop_sequences: ["Question:", "</s>", "<|im_end|>"]
+  math500:
+    count: 10
+    dataset_path: HuggingFaceH4/MATH-500
+    revision: 6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be
+    split: test
+    selection: deterministic_hash_sample
+    generation_length: 512
+    fewshot: 0
+    grader: math_verify
+    stop_sequences: ["</s>", "<|im_end|>"]
+  mbpp:
+    count: 10
+    lm_eval_task: mbpp
+    selection: deterministic_hash_sample
+    generation_length: 256
+    fewshot: 3
+    grader: lm_eval_code_eval_pass_at_1
+    stop_sequences: ["[DONE]", "</s>", "<|im_end|>"]
+  humaneval:
+    count: 10
+    lm_eval_task: humaneval
+    selection: deterministic_hash_sample
+    generation_length: 1024
+    fewshot: 0
+    grader: lm_eval_code_eval_pass_at_1
+    stop_sequences: ["\nclass", "\ndef", "\n#", "\nif", "\nprint", "</s>", "<|im_end|>"]
+resources:
+  max_examples: 40
+  max_branches: 40
+  max_gpu_hours: 3
+  max_wall_hours: 3
+  max_output_gb: 2

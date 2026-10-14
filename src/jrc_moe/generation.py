@@ -13,17 +13,22 @@ from .routing import allocation_for_forward
 def extract_target_predictions_and_confidence(
     logits,
     prompt_len,
+    generation_length=None,
 ):
+    generated_length = GEN_LENGTH if generation_length is None else int(generation_length)
+    if generated_length <= 0 or generated_length % BLOCK_LENGTH:
+        raise ValueError(f"generation_length must be a positive multiple of {BLOCK_LENGTH}")
+    num_blocks = generated_length // BLOCK_LENGTH
     target_pred = torch.empty(
-        GEN_LENGTH,
+        generated_length,
         dtype=torch.long,
     )
     target_conf = torch.empty(
-        GEN_LENGTH,
+        generated_length,
         dtype=torch.float64,
     )
 
-    for b in range(NUM_BLOCKS):
+    for b in range(num_blocks):
         abs_start = prompt_len + b * BLOCK_LENGTH
         abs_end = abs_start + BLOCK_LENGTH
 
@@ -71,11 +76,16 @@ def generate_with_routing_mode(
     before_forward_nfe=None,
     forward_observer=None,
     sensitivity_observer=None,
+    generation_length=None,
 ):
+    generated_length = GEN_LENGTH if generation_length is None else int(generation_length)
+    if generated_length <= 0 or generated_length % BLOCK_LENGTH:
+        raise ValueError(f"generation_length must be a positive multiple of {BLOCK_LENGTH}")
+    num_blocks = generated_length // BLOCK_LENGTH
     prompt_ids = prompt_ids.to(resolve_input_device(model))
 
     prompt_len = int(prompt_ids.shape[1])
-    total_len = prompt_len + GEN_LENGTH
+    total_len = prompt_len + generated_length
 
     if resume_state is None:
         x = torch.full(
@@ -109,7 +119,7 @@ def generate_with_routing_mode(
 
     replay_first_forward = resume_state is not None
 
-    for block_idx in range(start_block, NUM_BLOCKS):
+    for block_idx in range(start_block, num_blocks):
         abs_start = prompt_len + block_idx * BLOCK_LENGTH
         abs_end = abs_start + BLOCK_LENGTH
         local_nfe = restored_local_nfe if replay_first_forward else 0
@@ -161,6 +171,7 @@ def generate_with_routing_mode(
                     block_idx,
                     unresolved_abs,
                     confidence_history,
+                    generation_length=generated_length,
                 )
 
             from .jrc_v4.controller import LayerwiseKController
@@ -186,7 +197,7 @@ def generate_with_routing_mode(
                         local_nfe=local_nfe,
                         confidence_history=dict(confidence_history),
                         decoder_counters={"total_pairs": total_pairs},
-                        sampler=dict(sampler_settings or {"generation_length": GEN_LENGTH, "block_length": BLOCK_LENGTH}),
+                        sampler=dict(sampler_settings or {"generation_length": generated_length, "block_length": BLOCK_LENGTH}),
                         threshold=THETA,
                         commit_policy="threshold_with_argmax_fallback",
                         k_by_layer=tuple(tuple(int(v) for v in row) for row in k_matrix),
@@ -252,6 +263,7 @@ def generate_with_routing_mode(
                 extract_target_predictions_and_confidence(
                     outputs.logits,
                     prompt_len,
+                    generated_length,
                 )
             )
 
@@ -413,11 +425,17 @@ def generate_with_routing_mode(
 def validate_trace(
     trace_df,
     mode,
+    *,
+    generation_length=None,
 ):
+    generated_length = GEN_LENGTH if generation_length is None else int(generation_length)
+    if generated_length <= 0 or generated_length % BLOCK_LENGTH:
+        raise ValueError(f"generation_length must be a positive multiple of {BLOCK_LENGTH}")
+    num_blocks = generated_length // BLOCK_LENGTH
     errors = []
 
     for b in range(
-        NUM_BLOCKS
+        num_blocks
     ):
         g = (
             trace_df[
@@ -562,10 +580,10 @@ def validate_trace(
         )
 
 
-def postprocess_generated_region(generated_ids, tokenizer):
+def postprocess_generated_region(generated_ids, tokenizer, stop_sequences=None):
     raw_text = tokenizer.decode(generated_ids, skip_special_tokens=False)
     stopped = raw_text
-    for stop_seq in STOP_SEQUENCES:
+    for stop_seq in (STOP_SEQUENCES if stop_sequences is None else stop_sequences):
         if stop_seq in stopped: stopped = stopped.split(stop_seq)[0]
     clean = tokenizer.decode(tokenizer(stopped)["input_ids"], skip_special_tokens=True)
     return raw_text, clean

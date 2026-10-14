@@ -21,6 +21,9 @@ dependencies = [
   "transformers==4.53.2",
 ]
 
+[project.optional-dependencies]
+math-eval = ["lm_eval[math]==0.4.8", "math-verify"]
+
 [project.scripts]
 jrc-moe = "jrc_moe.cli:main"
 

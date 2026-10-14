@@ -178,15 +178,18 @@ def install_variable_k_patch(model, controller):
     return patched
 
 
-def position_block_ids(prompt_len):
+def position_block_ids(prompt_len, generation_length=None):
+    generated_length = GEN_LENGTH if generation_length is None else int(generation_length)
+    if generated_length <= 0 or generated_length % BLOCK_LENGTH:
+        raise ValueError(f"generation_length must be a positive multiple of {BLOCK_LENGTH}")
     ids = torch.empty(
-        prompt_len + GEN_LENGTH,
+        prompt_len + generated_length,
         dtype=torch.long,
     )
     ids[:prompt_len] = 0
 
     target_rel = torch.arange(
-        GEN_LENGTH,
+        generated_length,
         dtype=torch.long,
     )
     ids[prompt_len:] = (
@@ -195,8 +198,8 @@ def position_block_ids(prompt_len):
     return ids
 
 
-def rrb_counts_for_forward(prompt_len, active_block_idx):
-    block_ids = position_block_ids(prompt_len)
+def rrb_counts_for_forward(prompt_len, active_block_idx, generation_length=None):
+    block_ids = position_block_ids(prompt_len, generation_length=generation_length)
     active_paper = active_block_idx + 1
     distance = (block_ids - active_paper).abs()
 
@@ -366,8 +369,12 @@ def allocation_for_forward(
     active_block_idx,
     unresolved_abs_positions,
     confidence_history,
+    generation_length=None,
 ):
-    total_len = prompt_len + GEN_LENGTH
+    generated_length = GEN_LENGTH if generation_length is None else int(generation_length)
+    if generated_length <= 0 or generated_length % BLOCK_LENGTH:
+        raise ValueError(f"generation_length must be a positive multiple of {BLOCK_LENGTH}")
+    total_len = prompt_len + generated_length
 
     if mode == "fixed8":
         counts = torch.full((total_len,), 8, dtype=torch.long)
@@ -377,6 +384,7 @@ def allocation_for_forward(
         counts, _, _ = rrb_counts_for_forward(
             prompt_len,
             active_block_idx,
+            generation_length=generated_length,
         )
         fger_meta = None
 
@@ -395,6 +403,7 @@ def allocation_for_forward(
         counts, _, _ = rrb_counts_for_forward(
             prompt_len,
             active_block_idx,
+            generation_length=generated_length,
         )
         rrb_budget = int(counts.sum())
 
