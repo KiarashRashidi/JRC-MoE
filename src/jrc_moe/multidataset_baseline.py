@@ -468,6 +468,8 @@ def run(config_path: str | Path, output_dir: str | Path, repo_root: str | Path, 
     failure_count = sum(1 for _ in failures_path.open(encoding="utf-8")) if failures_path.exists() else 0
     manifest.update({
         "status": "complete" if len(done) == 40 else "partial", "mode": MODE_REFLEX,
+        "prepared_code_commit": manifest.get("prepared_code_commit", manifest.get("code_commit")),
+        "code_commit": _git_commit(Path(repo_root).resolve()),
         "checkpoint_revision": config["model"]["revision"], "fixed8_parity": parity,
         "grader_preflight": grader_preflight, "completed_count": len(done),
         "newly_completed_this_run": newly_completed, "failure_count": failure_count,
