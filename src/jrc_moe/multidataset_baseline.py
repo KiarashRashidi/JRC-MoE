@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -49,6 +50,8 @@ def _stable_id(dataset: str, doc: dict[str, Any], index: int) -> str:
 
 
 def validate_config(config: dict[str, Any]) -> None:
+    if config.get("experiment", {}).get("mode") != "reflex":
+        raise ValueError("this baseline is REFLEX-only")
     datasets = config.get("datasets")
     if not isinstance(datasets, dict) or tuple(datasets) != DATASET_ORDER:
         raise ValueError(f"datasets must be ordered and contain exactly {DATASET_ORDER}")
@@ -60,6 +63,8 @@ def validate_config(config: dict[str, Any]) -> None:
         length = int(spec["generation_length"])
         if length <= 0 or length % block:
             raise ValueError(f"{name} generation_length must be a positive multiple of {block}")
+    if int(config.get("resources", {}).get("max_examples", 40)) != 40:
+        raise ValueError("max_examples must be 40 for this fixed protocol")
 
 
 def _lm_eval_task(name: str):
@@ -253,7 +258,16 @@ def _preflight_metrics():
                             predictions=[["def add(a, b): return a + b"]], k=[1])
     if float(result[0]["pass@1"]) != 1.0:
         raise RuntimeError(f"code_eval pass@1 preflight failed: {result}")
-    return metric, {"math_verify": "passed", "code_eval_pass_at_1": "passed"}
+    packages = {}
+    for package in ("lm_eval", "datasets", "evaluate", "math-verify", "torch", "transformers"):
+        try:
+            packages[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            packages[package] = None
+    return metric, {
+        "math_verify": "passed", "code_eval_pass_at_1": "passed",
+        "package_versions": packages,
+    }
 
 
 def _grade_case(case, generated_text, code_metric):

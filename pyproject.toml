@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-math-eval = ["lm_eval[math]==0.4.8", "math-verify"]
+math-eval = ["lm_eval[math]==0.4.8", "math-verify==0.9.0"]
 
 [project.scripts]
 jrc-moe = "jrc_moe.cli:main"
