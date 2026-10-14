@@ -369,6 +369,8 @@ def run(config_path: str | Path, output_dir: str | Path, repo_root: str | Path, 
     else:
         progress = {"branches_started": 0, "gpu_seconds": 0.0, "wall_seconds": 0.0,
                     "output_bytes": _output_bytes(output_dir), "stopped_reason": None}
+    # This cap limits one invocation; cumulative GPU/wall/output caps persist across resumes.
+    progress["branches_started_this_run"] = 0
     caps = config.get("resources", {})
     max_gpu_seconds = float(caps.get("max_gpu_hours", 3)) * 3600
     max_wall_seconds = float(caps.get("max_wall_hours", 3)) * 3600
@@ -400,7 +402,7 @@ def run(config_path: str | Path, output_dir: str | Path, repo_root: str | Path, 
             continue
         elapsed_wall = previous_wall_seconds + time.perf_counter() - process_started
         progress["output_bytes"] = _output_bytes(output_dir)
-        if progress["branches_started"] >= max_branches:
+        if progress["branches_started_this_run"] >= max_branches:
             progress["stopped_reason"] = "max_branches"
         elif float(progress["gpu_seconds"]) >= max_gpu_seconds:
             progress["stopped_reason"] = "max_gpu_hours"
@@ -419,6 +421,7 @@ def run(config_path: str | Path, output_dir: str | Path, repo_root: str | Path, 
         gpu_event_start.record()
         branch_gpu_seconds = 0.0
         progress["branches_started"] += 1
+        progress["branches_started_this_run"] += 1
         try:
             prompt_ids = build_model_input(case["prompt"], tokenizer)[1]
             output_ids, trace, meta = generate_with_routing_mode(

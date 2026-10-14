@@ -14,6 +14,7 @@ This extension runs the existing `reflex` routing mode once for each of 40 promp
 - MBPP and HumanEval scoring executes generated Python in the `lm_eval` `code_eval` metric. This is executable code from model outputs, so run it only in an isolated, disposable account or container. The metric requires `HF_ALLOW_CODE_EVAL=1`; the preflight itself runs only a harmless synthetic addition function. If the evaluator or its cache cannot load, the run stops before GPU inference.
 - Fixed8 patch parity is rechecked before the first REFLEX rollout. Full prompts, references, per-example generations, traces, grader outputs, errors, dataset/task revisions, and configuration hashes are saved for independent review.
 - Output is resumable by dataset ID. A completed result is skipped only if both its result row and trace file exist. Failed attempts are retained in `failures.jsonl`.
+- Resource caps are cumulative across resumes for GPU time, wall time, and output size. `max_branches` limits attempts in a single invocation, so a canary or interrupted run does not prevent the resumable completion of all 40 unique examples.
 
 ## Commands on `research-gpu`
 
