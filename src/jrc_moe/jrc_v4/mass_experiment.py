@@ -30,6 +30,14 @@ def _read(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _attempted_keys(rows: list[dict], failures: list[dict]) -> set[tuple[str, str]]:
+    completed = {(str(row["prompt_id"]), str(row["arm"])) for row in rows
+                 if row.get("status") == "completed"}
+    failed = {(str(row["prompt_id"]), str(row["arm"])) for row in failures
+              if row.get("status") == "failed"}
+    return completed | failed
+
+
 def _validate_mass_trace(trace, *, num_blocks: int = 8, block_length: int = 32) -> None:
     required = {"block_idx", "local_nfe", "global_nfe", "masked_before",
                 "masked_after", "num_committed", "direct_pairs", "forward_mean_k"}
@@ -277,7 +285,6 @@ def _run_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
             model, prompt_ids, "fixed8", controller, allocation_provider=provider,
             forward_observer=observe, checkpoint_revision=config["model"]["revision"],
             config_digest=config_digest)
-        _validate_mass_trace(trace)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             end_event.record()
@@ -285,6 +292,7 @@ def _run_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
             cuda_seconds = float(start_event.elapsed_time(end_event) / 1000)
         else:
             cuda_seconds = None
+        _validate_mass_trace(trace)
         prompt_len = int(prompt_ids.shape[1])
         generated = output_ids[0, prompt_len:].detach().cpu().tolist()
         raw_text, clean_text = postprocess_generated_region(generated, tokenizer)
@@ -297,6 +305,17 @@ def _run_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
                 "cuda_event_seconds": cuda_seconds, "policy_rows": policy_rows,
                 "selected_events": selected, "trace_records": trace.to_dict(orient="records"),
                 "seed": int(seed)}
+    except Exception as exc:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+                end_event.record()
+                torch.cuda.synchronize()
+                setattr(exc, "jrc_cuda_event_seconds",
+                        float(start_event.elapsed_time(end_event) / 1000))
+            except Exception:
+                setattr(exc, "jrc_cuda_event_seconds", None)
+        raise
     finally:
         for _, module in model.named_modules():
             if hasattr(module, "_jrc_v4_original_forward"):
@@ -458,7 +477,9 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                         max_wall_hours=float(caps_raw["max_wall_hours"]), max_output_gb=float(caps_raw["max_output_gb"]))
     ledger = BudgetLedger.resume_from(caps, output_dir) if resume and (output_dir / "progress.json").exists() else BudgetLedger(caps, output_dir)
     rows = _read(output_dir / "branch_outcomes.jsonl")
-    completed = {(str(r["prompt_id"]), str(r["arm"])) for r in rows if r.get("status") == "completed"}
+    failures_path = output_dir / "failures.jsonl"
+    failures = _read(failures_path)
+    attempted = _attempted_keys(rows, failures)
     controller = LayerwiseKController(runtime["names"], min_k=1, max_k=64)
     arms = tuple(raw["policy"]["arms"])
     try:
@@ -469,13 +490,25 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
             random.Random(int(raw["statistics"]["bootstrap_seed"]) + pid).shuffle(order)
             for arm in order:
                 key = (str(pid), arm)
-                if key in completed:
+                if key in attempted:
                     continue
                 ledger.check_before_branch(str(pid), reserve_gpu_seconds=float(caps_raw["branch_reserve_gpu_seconds"]), reserve_output_bytes=65536)
-                result = _run_arm(model=model, tokenizer=tokenizer, prompt_ids=prompt_ids,
-                                  prompt_id=str(pid), arm=arm, controller=controller,
-                                  runtime=runtime, config=raw, config_digest=digest,
-                                  seed=int(raw["statistics"]["bootstrap_seed"]) + pid)
+                try:
+                    result = _run_arm(model=model, tokenizer=tokenizer, prompt_ids=prompt_ids,
+                                      prompt_id=str(pid), arm=arm, controller=controller,
+                                      runtime=runtime, config=raw, config_digest=digest,
+                                      seed=int(raw["statistics"]["bootstrap_seed"]) + pid)
+                except Exception as exc:
+                    cuda_seconds = getattr(exc, "jrc_cuda_event_seconds", None)
+                    if cuda_seconds is not None:
+                        ledger.add_gpu_time(float(cuda_seconds))
+                    failure = {"prompt_id": str(pid), "arm": arm, "status": "failed",
+                               "error_type": type(exc).__name__, "error": str(exc),
+                               "cuda_event_seconds": cuda_seconds, "time_unix": time.time()}
+                    _append(failures_path, failure)
+                    failures.append(failure)
+                    attempted.add(key)
+                    continue
                 grade = canonical_grade_text(result["clean_text"], records[pid]["gold_full_answer"])
                 result["canonical_correct"] = int(grade["canonical_correct"])
                 result["canonical_prediction"] = grade.get("prediction")
@@ -523,7 +556,7 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                 trace.to_csv(output_dir / "traces" / f"{pid}_{arm}.csv", index=False)
                 _append(output_dir / "branch_outcomes.jsonl", result)
                 rows.append(result)
-                completed.add(key)
+                attempted.add(key)
     finally:
         for _, module in model.named_modules():
             if hasattr(module, "_jrc_v4_original_forward"):
@@ -534,12 +567,15 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
             torch.cuda.empty_cache()
         del runtime["model"], runtime["tokenizer"]
     summary = _summarize(rows, raw)
-    summary.update({"identity": identity, "resource_ledger": ledger.snapshot(), "audit_status": audit["status"]})
+    summary.update({"identity": identity, "resource_ledger": ledger.snapshot(),
+                    "audit_status": audit["status"], "failed_branch_count": len(failures),
+                    "attempted_branch_count": ledger.branches_started})
     atomic_write_json(output_dir / "summary.json", summary)
     atomic_write_json(output_dir / "manifest.json", {"protocol_version": raw["protocol_version"],
         "stage": "mass_pilot", "status": summary["status"], "git_commit": commit,
         "config_sha256": digest, "prompt_count": summary["prompt_count"],
-        "branch_count": summary["branch_count"], "resource_ledger": ledger.snapshot(),
+        "branch_count": summary["branch_count"], "failed_branch_count": len(failures),
+        "attempted_branch_count": ledger.branches_started, "resource_ledger": ledger.snapshot(),
         "scientific_claims": "bounded_development_only", "summary": str(output_dir / "summary.json")})
     return summary
 

@@ -304,7 +304,10 @@ def generate_with_routing_mode(
                 (x[0, abs_start:abs_end] == MASK_ID).sum()
             )
 
-            k_tensor = torch.as_tensor(k_counts, dtype=torch.long)
+            # In cumulative-mass mode, k_counts is the requested P threshold,
+            # not a number of experts. The controller exposes the realized
+            # expert count for each layer/position after the router resolves P.
+            k_tensor = torch.as_tensor(pair_meta["k_by_layer"], dtype=torch.long)
             vals, freq = torch.unique(
                 k_tensor,
                 return_counts=True,

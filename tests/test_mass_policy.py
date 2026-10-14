@@ -6,7 +6,7 @@ from jrc_moe.jrc_v4.mass_policy import (
     experts_for_cumulative_mass,
 )
 from jrc_moe.jrc_v4.controller import LayerwiseKController
-from jrc_moe.jrc_v4.mass_experiment import _providers, _summarize
+from jrc_moe.jrc_v4.mass_experiment import _attempted_keys, _providers, _summarize
 
 
 def test_low_and_high_confidence_extremes_reverse_probabilities():
@@ -54,6 +54,12 @@ def test_prompt_heterogeneity_config_builds_confidence_provider():
     assert len(plan) == 2
     assert all(row[1] in (0.1, 0.6, 0.9) for row in plan)
     assert metadata["positions_with_prior_confidence"] == 1
+
+
+def test_failed_branch_is_not_retried_past_attempt_cap():
+    rows = [{"prompt_id": 322, "arm": "fixed_p06", "status": "completed"}]
+    failures = [{"prompt_id": "322", "arm": "fixed_p01", "status": "failed"}]
+    assert _attempted_keys(rows, failures) == {("322", "fixed_p06"), ("322", "fixed_p01")}
 
 
 def test_cumulative_router_mass_uses_shortest_prefix():
