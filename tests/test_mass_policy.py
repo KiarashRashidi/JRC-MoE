@@ -6,6 +6,7 @@ from jrc_moe.jrc_v4.mass_policy import (
     experts_for_cumulative_mass,
 )
 from jrc_moe.jrc_v4.controller import LayerwiseKController
+from jrc_moe.jrc_v4.mass_experiment import _summarize
 
 
 def test_low_and_high_confidence_extremes_reverse_probabilities():
@@ -26,12 +27,18 @@ def test_plan_is_reproducible_and_unknown_history_stays_at_point_six():
     assert meta["positions_with_prior_confidence"] == 1
 
 
-def test_fixed_mass_is_point_six_for_every_position_and_layer():
+def test_fixed_mass_is_constant_even_when_confidence_history_exists():
     plan, _ = build_mass_plan(sequence_length=5, num_layers=3,
-                              unresolved_positions=(1,), confidence_history={},
+                              unresolved_positions=(1,), confidence_history={1: [.1]},
                               variant="fixed", seed=1, prompt_id="p",
                               block_idx=0, global_nfe=1)
     assert plan == [[.6] * 5 for _ in range(3)]
+    low_plan, meta = build_mass_plan(sequence_length=5, num_layers=3,
+                                     unresolved_positions=(1,), confidence_history={1: [.99]},
+                                     variant="fixed", base_mass=.1, seed=1,
+                                     prompt_id="p", block_idx=0, global_nfe=1)
+    assert low_plan == [[.1] * 5 for _ in range(3)]
+    assert meta["nonbase_assignment_count"] == 0
 
 
 def test_cumulative_router_mass_uses_shortest_prefix():
@@ -57,3 +64,33 @@ def test_controller_accounts_for_resolved_k_and_achieved_mass():
     assert result["mass_summary"]["expert_count_histogram"] == {"2": 1, "1": 1}
     assert result["mass_summary"]["achieved_mass_sum"] == pytest.approx(1.3)
     assert result["mass_summary"]["mass_target_violations"] == 0
+
+
+def test_prompt_summary_exposes_mass_and_probability_heterogeneity():
+    arms = ("fixed_p06", "fixed_p01", "confidence_adaptive_baseprob",
+            "confidence_adaptive_halfprob")
+    rows = []
+    for prompt_id, shift in (("1", 0), ("2", 1)):
+        for arm_index, arm in enumerate(arms):
+            rows.append({
+                "prompt_id": prompt_id, "arm": arm,
+                "canonical_correct": int(arm_index != 1),
+                "generated_ids_sha256": f"{prompt_id}-{arm_index}",
+                "total_pairs": 100 + arm_index * 10 + shift * (arm_index + 1),
+                "total_nfe": 8, "avg_k": 2.0 + arm_index,
+                "wall_seconds": 1.0 + arm_index, "cuda_event_seconds": 0.5 + arm_index,
+                "mass_summary": {"token_count": 10, "expert_count_sum": 20,
+                                 "achieved_mass_sum": 6.0, "mass_target_violations": 0,
+                                 "expert_count_by_target": {"0.6": {"2": 10}},
+                                 "target_mass_histogram": {"0.6": 10}},
+                "policy_summary": [],
+            })
+    config = {"dataset": {"prompts": 2}, "statistics": {
+        "bootstrap_seed": 9, "bootstrap_resamples": 100},
+        "policy": {"arms": list(arms)}}
+    summary = _summarize(rows, config)
+    assert summary["status"] == "complete"
+    assert summary["branch_count"] == 8
+    assert len(summary["prompt_level_effects"]) == 2
+    assert "halfprob_minus_baseprob" in summary["paired_contrasts"]
+    assert summary["prompt_level_effects"][0]["contrasts"]["halfprob_minus_baseprob"]["expert_token_pair_difference"] == 10

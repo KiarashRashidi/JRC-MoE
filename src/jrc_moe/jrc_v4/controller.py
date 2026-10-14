@@ -127,6 +127,7 @@ class LayerwiseKController:
         self._override_fires = 0
         self._route_records = {}
         self._mass_summary = ({"expert_count_histogram": {}, "target_mass_histogram": {},
+                               "expert_count_by_target": {}, "achieved_mass_sum_by_target": {},
                                "achieved_mass_sum": 0.0, "achieved_mass_min": 1.0,
                                "achieved_mass_max": 0.0, "mass_target_violations": 0,
                                "token_count": 0} if mass_mode else None)
@@ -185,6 +186,10 @@ class LayerwiseKController:
             k_key, p_key = str(count), f"{target:.1f}"
             summary["expert_count_histogram"][k_key] = summary["expert_count_histogram"].get(k_key, 0) + 1
             summary["target_mass_histogram"][p_key] = summary["target_mass_histogram"].get(p_key, 0) + 1
+            by_target = summary["expert_count_by_target"].setdefault(p_key, {})
+            by_target[k_key] = by_target.get(k_key, 0) + 1
+            summary["achieved_mass_sum_by_target"][p_key] = (
+                summary["achieved_mass_sum_by_target"].get(p_key, 0.0) + mass)
             summary["achieved_mass_sum"] += mass
             summary["achieved_mass_min"] = min(summary["achieved_mass_min"], mass)
             summary["achieved_mass_max"] = max(summary["achieved_mass_max"], mass)

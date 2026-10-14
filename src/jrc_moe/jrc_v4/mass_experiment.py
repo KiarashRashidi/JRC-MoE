@@ -54,11 +54,17 @@ def _validate_mass_trace(trace, *, num_blocks: int = 8, block_length: int = 32) 
 def _config(path: Path) -> dict:
     import yaml
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict) or raw.get("protocol_version") != "jrc-v4-confidence-router-mass-1":
+    if not isinstance(raw, dict) or raw.get("protocol_version") not in {
+            "jrc-v4-confidence-router-mass-1", "jrc-v4-prompt-router-heterogeneity-1"}:
         raise ValueError("unexpected router-mass protocol configuration")
     policy = raw["policy"]
     if policy["base_mass"] != 0.6 or policy["low_mass"] != 0.1 or policy["high_mass"] != 0.9:
         raise ValueError("this pilot is frozen to P=.6 control and adaptive P=.1/.9")
+    if raw["protocol_version"] == "jrc-v4-prompt-router-heterogeneity-1":
+        required = ["fixed_p06", "fixed_p01", "confidence_adaptive_baseprob",
+                    "confidence_adaptive_halfprob"]
+        if list(policy.get("arms", [])) != required:
+            raise ValueError(f"prompt heterogeneity pilot arms must be {required}")
     return raw
 
 
@@ -66,7 +72,7 @@ def _providers(*, config: dict, prompt_id: str, seed: int, num_layers: int):
     from .mass_policy import build_mass_plan
     policy = config["policy"]
 
-    def provider(variant):
+    def provider(variant, *, fixed_mass=None, probability_scale=1.0):
         def allocate(*, prompt_len, block_idx, unresolved_abs, confidence_history,
                      global_nfe, **kwargs):
             return build_mass_plan(
@@ -74,15 +80,23 @@ def _providers(*, config: dict, prompt_id: str, seed: int, num_layers: int):
                 num_layers=num_layers, unresolved_positions=unresolved_abs,
                 confidence_history=confidence_history, variant=variant, seed=seed,
                 prompt_id=prompt_id, block_idx=block_idx, global_nfe=global_nfe,
-                base_mass=float(policy["base_mass"]), low_mass=float(policy["low_mass"]),
+                base_mass=float(policy["base_mass"] if fixed_mass is None else fixed_mass),
+                low_mass=float(policy["low_mass"]),
                 high_mass=float(policy["high_mass"]),
                 low_confidence=float(policy["low_confidence"]),
                 high_confidence=float(policy["high_confidence"]),
-                low_mass_probability=float(policy["low_confidence_p_low"]),
-                high_mass_probability=float(policy["high_confidence_p_low"]),
+                low_mass_probability=float(policy["low_confidence_p_low"] * probability_scale),
+                high_mass_probability=float(policy["high_confidence_p_low"] * probability_scale),
             )
         return allocate
-    return provider("fixed"), provider("confidence_adaptive")
+    return {
+        "fixed_p06": provider("fixed", fixed_mass=float(policy["base_mass"])),
+        "fixed_p01": provider("fixed", fixed_mass=float(policy["low_mass"])),
+        "confidence_adaptive_baseprob": provider("confidence_adaptive", probability_scale=1.0),
+        "confidence_adaptive_halfprob": provider(
+            "confidence_adaptive", probability_scale=float(policy.get("half_probability_scale", 0.5))),
+        "confidence_adaptive": provider("confidence_adaptive", probability_scale=1.0),
+    }
 
 
 def _load_runtime(root: Path, config: dict, config_path: Path):
@@ -103,15 +117,18 @@ def _mass_forward_gate(runtime: dict, config: dict) -> dict:
     names = runtime["names"]
     controller = LayerwiseKController(names, min_k=1, max_k=64,
                                       monitored_layers=tuple(range(len(names))),
-                                      monitored_positions=(0,))
+                                      monitored_positions=(0, 1, 2))
     install_layerwise_patch(model, controller, runtime["contract"])
     input_ids = runtime["first_prompt_ids"]
     mask_input = input_ids.clone()
     from ..config import MASK_ID, GEN_LENGTH
     mask_input = torch.cat([mask_input, torch.full((1, GEN_LENGTH), MASK_ID,
                              dtype=mask_input.dtype, device=mask_input.device)], dim=1)
-    target = float(config["policy"]["base_mass"])
-    plan = [[target] * int(mask_input.shape[1]) for _ in names]
+    targets = (float(config["policy"]["low_mass"]),
+               float(config["policy"]["base_mass"]),
+               float(config["policy"]["high_mass"]))
+    plan = [[targets[position % len(targets)] for position in range(int(mask_input.shape[1]))]
+            for _ in names]
     try:
         controller.begin_forward(plan, global_nfe=1)
         with torch.inference_mode():
@@ -123,17 +140,25 @@ def _mass_forward_gate(runtime: dict, config: dict) -> dict:
         checked = [record for record in result["routing_records"].values()
                    if abs(float(record["router_statistics"]["top_k_gate_mass"]) -
                           sum(record["weights"])) <= 5e-4]
-        if not torch.isfinite(first_logits).all() or not route_counts:
-            raise RuntimeError("P=.6 mass forward produced nonfinite logits or no route records")
-        if any(mass + 5e-4 < target for mass in masses):
+        if not torch.isfinite(first_logits).all() or len(route_counts) != len(names) * len(targets):
+            raise RuntimeError("mixed-P mass forward produced nonfinite logits or incomplete route records")
+        expected_by_position = {position: targets[position % len(targets)] for position in (0, 1, 2)}
+        if any(mass + 5e-4 < expected_by_position[position]
+               for (layer, position), record in result["routing_records"].items()
+               for mass in (sum(record["weights"]),)):
             raise RuntimeError("actual selected router mass fell below its P target")
         mass_summary = result["mass_summary"]
         if mass_summary["mass_target_violations"]:
             raise RuntimeError("one or more GPU-routed tokens failed to reach the requested cumulative mass")
-        return {"passed": True, "target_mass": target,
+        per_target_counts = mass_summary["expert_count_by_target"]
+        per_target_mass = mass_summary["achieved_mass_sum_by_target"]
+        return {"passed": True, "target_masses": list(targets),
                 "recorded_tokens": len(route_counts),
-                "mean_experts_at_p06": sum(route_counts) / len(route_counts),
-                "max_experts_at_p06": max(route_counts),
+                "monitored_mean_experts_by_target": {
+                    f"{expected_by_position[position]:.1f}": sum(
+                        len(record["experts"]) for (layer, observed_position), record in result["routing_records"].items()
+                        if observed_position == position) / len(names)
+                    for position in (0, 1, 2)},
                 "mean_achieved_mass": sum(masses) / len(masses),
                 "min_achieved_mass": min(masses),
                 "all_layer_token_count": int(mass_summary["token_count"]),
@@ -141,6 +166,14 @@ def _mass_forward_gate(runtime: dict, config: dict) -> dict:
                     mass_summary["expert_count_histogram"].items()) / int(mass_summary["token_count"]),
                 "all_layer_mean_achieved_mass": mass_summary["achieved_mass_sum"] / mass_summary["token_count"],
                 "all_layer_expert_count_histogram": mass_summary["expert_count_histogram"],
+                "all_layer_expert_count_by_target": per_target_counts,
+                "all_layer_mean_experts_by_target": {
+                    target: sum(int(k) * int(count) for k, count in histogram.items()) /
+                    sum(int(count) for count in histogram.values())
+                    for target, histogram in per_target_counts.items()},
+                "all_layer_mean_achieved_mass_by_target": {
+                    target: per_target_mass[target] / sum(int(count) for count in per_target_counts[target].values())
+                    for target in per_target_counts},
                 "finite_logits": True,
                 "router_mass_accounting_checks": len(checked)}
     finally:
@@ -166,16 +199,16 @@ def run_audit(*, root: Path, config_path: Path, output_dir: Path) -> dict:
         gate = _mass_forward_gate(runtime, raw)
         # The plan itself is a deterministic replay contract; regenerate an
         # identical draw matrix before allowing expensive full rollouts.
-        fixed, adaptive = _providers(config=raw, prompt_id=str(runtime["ids"][0]),
-                                     seed=int(raw["statistics"]["bootstrap_seed"]),
-                                     num_layers=len(runtime["names"]))
+        providers = _providers(config=raw, prompt_id=str(runtime["ids"][0]),
+                               seed=int(raw["statistics"]["bootstrap_seed"]),
+                               num_layers=len(runtime["names"]))
         position = [int(runtime["first_prompt_ids"].shape[1])]
         confidence = {position[0]: [0.37]}
-        left = adaptive(prompt_len=int(runtime["first_prompt_ids"].shape[1]), block_idx=0,
+        left = providers["confidence_adaptive_baseprob"](prompt_len=int(runtime["first_prompt_ids"].shape[1]), block_idx=0,
                         unresolved_abs=position, confidence_history=confidence, global_nfe=1)
-        right = adaptive(prompt_len=int(runtime["first_prompt_ids"].shape[1]), block_idx=0,
+        right = providers["confidence_adaptive_baseprob"](prompt_len=int(runtime["first_prompt_ids"].shape[1]), block_idx=0,
                          unresolved_abs=position, confidence_history=confidence, global_nfe=1)
-        if left != right or fixed(prompt_len=int(runtime["first_prompt_ids"].shape[1]), block_idx=0,
+        if left != right or providers["fixed_p06"](prompt_len=int(runtime["first_prompt_ids"].shape[1]), block_idx=0,
                                   unresolved_abs=position, confidence_history=confidence,
                                   global_nfe=1)[0] != [[0.6] * (int(runtime["first_prompt_ids"].shape[1]) + int(raw["decoder"]["generation_length"])) for _ in runtime["names"]]:
             raise RuntimeError("mass allocation replay/fixed-control gate failed")
@@ -217,9 +250,9 @@ def _run_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
     from .controller import LayerwiseKController
 
     install_layerwise_patch(model, controller, runtime["contract"])
-    fixed, adaptive = _providers(config=config, prompt_id=prompt_id, seed=seed,
-                                 num_layers=len(runtime["names"]))
-    provider = fixed if arm == "fixed_p06" else adaptive
+    providers = _providers(config=config, prompt_id=prompt_id, seed=seed,
+                           num_layers=len(runtime["names"]))
+    provider = providers[arm]
     policy_rows, selected = [], []
     def observe(payload):
         meta = payload.get("allocation_meta") or {}
@@ -276,39 +309,86 @@ def _run_arm(*, model, tokenizer, prompt_ids, prompt_id: str, arm: str,
 
 def _summarize(rows: list[dict], config: dict) -> dict:
     import numpy as np
-    from ..grading import canonical_grade_text
     paired = {}
     for row in rows:
         paired.setdefault(str(row["prompt_id"]), {})[row["arm"]] = row
+    control = "fixed_p06"
+    arms_expected = list(config["policy"]["arms"])
+    contrast_map = {arm + "_minus_fixed_p06": (arm, control)
+                    for arm in arms_expected if arm != control}
+    if {"confidence_adaptive_halfprob", "confidence_adaptive_baseprob"}.issubset(arms_expected):
+        contrast_map["halfprob_minus_baseprob"] = (
+            "confidence_adaptive_halfprob", "confidence_adaptive_baseprob")
     comparisons = {}
-    for metric in ("total_pairs", "total_nfe", "avg_k", "wall_seconds", "cuda_event_seconds"):
-        differences = [float(arms["confidence_adaptive"][metric] - arms["fixed_p06"][metric])
-                       for arms in paired.values() if set(arms) == {"fixed_p06", "confidence_adaptive"}
-                       and arms["confidence_adaptive"][metric] is not None and arms["fixed_p06"][metric] is not None]
-        rng = np.random.default_rng(int(config["statistics"]["bootstrap_seed"]) + len(comparisons))
-        vals = np.asarray(differences)
-        sims = vals[rng.integers(0, len(vals), size=(int(config["statistics"]["bootstrap_resamples"]), len(vals)))].mean(axis=1) if len(vals) else []
-        comparisons[metric + "_adaptive_minus_fixed"] = {
-            "mean": float(vals.mean()) if len(vals) else None,
-            "ci95": [float(x) for x in np.quantile(sims, [.025, .975])] if len(vals) else [None, None],
-            "n_prompts": len(vals)}
-    band_exposure = {band: {"eligible": 0, "p01": 0, "p06": 0, "p09": 0}
-                     for band in ("low", "middle", "high")}
+    metrics = ("total_pairs", "total_nfe", "avg_k", "wall_seconds", "cuda_event_seconds",
+               "canonical_correct")
+    for contrast_name, (left, right) in contrast_map.items():
+        comparisons[contrast_name] = {}
+        for metric in metrics:
+            diffs = [float(values[left][metric] - values[right][metric])
+                     for values in paired.values() if left in values and right in values
+                     and values[left].get(metric) is not None and values[right].get(metric) is not None]
+            vals = np.asarray(diffs, dtype=float)
+            rng = np.random.default_rng(int(config["statistics"]["bootstrap_seed"]) + len(comparisons) * 10 + len(comparisons[contrast_name]))
+            sims = (vals[rng.integers(0, len(vals), size=(int(config["statistics"]["bootstrap_resamples"]), len(vals)))].mean(axis=1)
+                    if len(vals) else [])
+            comparisons[contrast_name][metric + "_difference"] = {
+                "mean": float(vals.mean()) if len(vals) else None,
+                "ci95_prompt_bootstrap": [float(x) for x in np.quantile(sims, [.025, .975])] if len(vals) else [None, None],
+                "n_prompts": len(vals),
+                "between_prompt_sd": float(vals.std(ddof=1)) if len(vals) > 1 else None,
+                "between_prompt_range": [float(vals.min()), float(vals.max())] if len(vals) else [None, None]}
+    adaptive_arms = tuple(arm for arm in arms_expected if arm.startswith("confidence_adaptive"))
+    band_exposure = {arm: {band: {"eligible": 0, "p01": 0, "p06": 0, "p09": 0}
+                           for band in ("low", "middle", "high")} for arm in adaptive_arms}
     for row in rows:
-        if row["arm"] != "confidence_adaptive":
+        arm = row["arm"]
+        if arm not in band_exposure:
             continue
         for forward in row.get("policy_summary", []):
-            for band in band_exposure:
-                band_exposure[band]["eligible"] += int(forward.get("exposures_by_confidence_band", {}).get(band, 0))
+            for band in band_exposure[arm]:
+                band_exposure[arm][band]["eligible"] += int(forward.get("exposures_by_confidence_band", {}).get(band, 0))
             assignments = forward.get("assignments_by_band", {})
-            for band in band_exposure:
-                band_exposure[band]["p01"] += int(assignments.get(band, {}).get("p01", 0))
-                band_exposure[band]["p09"] += int(assignments.get(band, {}).get("p09", 0))
-    for record in band_exposure.values():
-        record["p06"] = record["eligible"] - record["p01"] - record["p09"]
-        record["p01_rate"] = record["p01"] / record["eligible"] if record["eligible"] else None
-        record["p09_rate"] = record["p09"] / record["eligible"] if record["eligible"] else None
-    all_complete = all(set(v) == {"fixed_p06", "confidence_adaptive"} for v in paired.values())
+            for band in band_exposure[arm]:
+                band_exposure[arm][band]["p01"] += int(assignments.get(band, {}).get("p01", 0))
+                band_exposure[arm][band]["p09"] += int(assignments.get(band, {}).get("p09", 0))
+    for by_arm in band_exposure.values():
+        for record in by_arm.values():
+            record["p06"] = record["eligible"] - record["p01"] - record["p09"]
+            record["p01_rate"] = record["p01"] / record["eligible"] if record["eligible"] else None
+            record["p09_rate"] = record["p09"] / record["eligible"] if record["eligible"] else None
+    all_complete = all(set(values) == set(arms_expected) for values in paired.values())
+    prompt_effects = []
+    for prompt_id, values in sorted(paired.items(), key=lambda item: int(item[0])):
+        baseline = values.get(control)
+        prompt_row = {"prompt_id": prompt_id, "arms": {}}
+        for arm in arms_expected:
+            row = values.get(arm)
+            if row is None:
+                continue
+            prompt_row["arms"][arm] = {
+                "canonical_correct": row.get("canonical_correct"),
+                "total_pairs": row.get("total_pairs"), "avg_k": row.get("avg_k"),
+                "wall_seconds": row.get("wall_seconds"),
+                "generated_sequence_changed_vs_fixed_p06": (
+                    None if baseline is None else row["generated_ids_sha256"] != baseline["generated_ids_sha256"]),
+                "correctness_delta_vs_fixed_p06": (
+                    None if baseline is None else row.get("canonical_correct", 0) - baseline.get("canonical_correct", 0)),
+                "pair_delta_vs_fixed_p06": (
+                    None if baseline is None else row.get("total_pairs", 0) - baseline.get("total_pairs", 0)),
+                "expert_count_by_target_mass": row.get("mass_summary", {}).get("expert_count_by_target", {}),
+                "target_mass_counts": row.get("mass_summary", {}).get("target_mass_histogram", {})}
+        prompt_row["contrasts"] = {}
+        for contrast_name, (left, right) in contrast_map.items():
+            if left not in values or right not in values:
+                continue
+            left_row, right_row = values[left], values[right]
+            prompt_row["contrasts"][contrast_name] = {
+                "correctness_difference": int(left_row.get("canonical_correct", 0)) - int(right_row.get("canonical_correct", 0)),
+                "expert_token_pair_difference": int(left_row.get("total_pairs", 0)) - int(right_row.get("total_pairs", 0)),
+                "mean_experts_difference": float(left_row.get("avg_k", 0)) - float(right_row.get("avg_k", 0)),
+                "sequence_changed": left_row["generated_ids_sha256"] != right_row["generated_ids_sha256"]}
+        prompt_effects.append(prompt_row)
     return {"status": "complete" if len(paired) == int(config["dataset"]["prompts"]) and all_complete else "partial",
             "prompt_count": len(paired), "branch_count": len(rows),
             "arms": {arm: {"n": sum(r["arm"] == arm for r in rows),
@@ -328,18 +408,11 @@ def _summarize(rows: list[dict], config: dict) -> dict:
                            max(1, sum(r["arm"] == arm for r in rows)),
                            "mean_wall_seconds": sum(r["wall_seconds"] for r in rows if r["arm"] == arm) /
                            max(1, sum(r["arm"] == arm for r in rows))}
-                     for arm in ("fixed_p06", "confidence_adaptive")},
-            "paired_vs_fixed_p06": comparisons,
+                     for arm in arms_expected},
+            "paired_contrasts": comparisons,
             "adaptive_mass_by_prior_confidence": band_exposure,
-            "changed_sequences": sum(v["fixed_p06"]["generated_ids_sha256"] != v["confidence_adaptive"]["generated_ids_sha256"]
-                                     for v in paired.values() if set(v) == {"fixed_p06", "confidence_adaptive"}),
-            "correctness_regressions": sum(v["fixed_p06"].get("canonical_correct", 0) == 1 and
-                                            v["confidence_adaptive"].get("canonical_correct", 0) == 0
-                                            for v in paired.values() if set(v) == {"fixed_p06", "confidence_adaptive"}),
-            "correctness_repairs": sum(v["fixed_p06"].get("canonical_correct", 0) == 0 and
-                                        v["confidence_adaptive"].get("canonical_correct", 0) == 1
-                                        for v in paired.values() if set(v) == {"fixed_p06", "confidence_adaptive"}),
-            "interpretation": "bounded development pilot; no predictive-benefit or acceleration claim without confirmatory evidence"}
+            "prompt_level_effects": prompt_effects,
+            "interpretation": "prompt-level effects are descriptive in this 10-prompt pilot; do not choose a prompt-specific setting from the same observations without held-out validation"}
 
 
 def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
@@ -387,7 +460,7 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
     rows = _read(output_dir / "branch_outcomes.jsonl")
     completed = {(str(r["prompt_id"]), str(r["arm"])) for r in rows if r.get("status") == "completed"}
     controller = LayerwiseKController(runtime["names"], min_k=1, max_k=64)
-    arms = ("fixed_p06", "confidence_adaptive")
+    arms = tuple(raw["policy"]["arms"])
     try:
         for pid in ids:
             _, prompt_ids = build_model_input(records[pid]["harness_context"], tokenizer)
@@ -411,7 +484,8 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                 result["policy_summary"] = []
                 aggregate_mass = {"token_count": 0, "expert_count_sum": 0,
                                   "achieved_mass_sum": 0.0, "mass_target_violations": 0,
-                                  "expert_count_histogram": {}, "target_mass_histogram": {}}
+                                  "expert_count_histogram": {}, "target_mass_histogram": {},
+                                  "expert_count_by_target": {}, "achieved_mass_sum_by_target": {}}
                 for forward in policy_rows:
                     mass = forward.get("mass_summary") or {}
                     aggregate_mass["token_count"] += int(mass.get("token_count", 0))
@@ -423,6 +497,13 @@ def run_pilot(*, root: Path, config_path: Path, audit_dir: Path,
                         aggregate_mass["expert_count_histogram"][key] = aggregate_mass["expert_count_histogram"].get(key, 0) + int(value)
                     for key, value in mass.get("target_mass_histogram", {}).items():
                         aggregate_mass["target_mass_histogram"][key] = aggregate_mass["target_mass_histogram"].get(key, 0) + int(value)
+                    for target, histogram in mass.get("expert_count_by_target", {}).items():
+                        destination = aggregate_mass["expert_count_by_target"].setdefault(target, {})
+                        for k, count in histogram.items():
+                            destination[k] = destination.get(k, 0) + int(count)
+                    for target, value in mass.get("achieved_mass_sum_by_target", {}).items():
+                        aggregate_mass["achieved_mass_sum_by_target"][target] = (
+                            aggregate_mass["achieved_mass_sum_by_target"].get(target, 0.0) + float(value))
                     counts = {band: {"p01": 0, "p09": 0} for band in ("low", "middle", "high")}
                     for event in forward.get("selected", []):
                         counts[event["confidence_band"]]["p01" if event["target_mass"] == .1 else "p09"] += 1

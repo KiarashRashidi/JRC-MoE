@@ -62,6 +62,17 @@ def build_mass_plan(*, sequence_length: int, num_layers: int,
     exposure = {"low": 0, "middle": 0, "high": 0}
     chosen = {"low_mass": 0, "base_mass": 0, "high_mass": 0}
     events = []
+    if variant == "fixed":
+        chosen["base_mass"] = sequence_length * num_layers
+        return plan, {
+            "variant": variant, "base_mass": float(base_mass),
+            "low_mass": float(low_mass), "high_mass": float(high_mass),
+            "eligible_positions": len(positions),
+            "positions_with_prior_confidence": sum(bool(confidence_history.get(p)) for p in positions),
+            "exposures_by_confidence_band": exposure,
+            "assignments_by_mass": chosen, "nonbase_assignment_count": 0,
+            "selected": [],
+        }
     for position in positions:
         history = confidence_history.get(position)
         if not history:
