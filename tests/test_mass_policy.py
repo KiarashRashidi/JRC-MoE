@@ -6,7 +6,7 @@ from jrc_moe.jrc_v4.mass_policy import (
     experts_for_cumulative_mass,
 )
 from jrc_moe.jrc_v4.controller import LayerwiseKController
-from jrc_moe.jrc_v4.mass_experiment import _summarize
+from jrc_moe.jrc_v4.mass_experiment import _providers, _summarize
 
 
 def test_low_and_high_confidence_extremes_reverse_probabilities():
@@ -39,6 +39,21 @@ def test_fixed_mass_is_constant_even_when_confidence_history_exists():
                                      prompt_id="p", block_idx=0, global_nfe=1)
     assert low_plan == [[.1] * 5 for _ in range(3)]
     assert meta["nonbase_assignment_count"] == 0
+
+
+def test_prompt_heterogeneity_config_builds_confidence_provider():
+    from pathlib import Path
+    import yaml
+
+    config_path = Path(__file__).parents[1] / "configs/jrc_v4/router_mass_prompt_heterogeneity.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    providers = _providers(config=config, prompt_id="test", seed=1, num_layers=2)
+    plan, metadata = providers["confidence_adaptive_baseprob"](
+        prompt_len=1, block_idx=0, unresolved_abs=(1,),
+        confidence_history={1: [0.5]}, global_nfe=1)
+    assert len(plan) == 2
+    assert all(row[1] in (0.1, 0.6, 0.9) for row in plan)
+    assert metadata["positions_with_prior_confidence"] == 1
 
 
 def test_cumulative_router_mass_uses_shortest_prefix():

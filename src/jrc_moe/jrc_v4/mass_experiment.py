@@ -83,8 +83,8 @@ def _providers(*, config: dict, prompt_id: str, seed: int, num_layers: int):
                 base_mass=float(policy["base_mass"] if fixed_mass is None else fixed_mass),
                 low_mass=float(policy["low_mass"]),
                 high_mass=float(policy["high_mass"]),
-                low_confidence=float(policy["low_confidence"]),
-                high_confidence=float(policy["high_confidence"]),
+                low_confidence=float(policy["low_confidence_boundary"]),
+                high_confidence=float(policy["high_confidence_boundary"]),
                 low_mass_probability=float(policy["low_confidence_p_low"] * probability_scale),
                 high_mass_probability=float(policy["high_confidence_p_low"] * probability_scale),
             )
