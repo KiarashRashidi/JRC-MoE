@@ -1,10 +1,12 @@
 import yaml
 import pytest
+import csv
 
 from jrc_moe.multidataset_baseline import (
     DATASET_ORDER,
     stable_sample,
     validate_config,
+    _write_summary,
 )
 
 
@@ -53,4 +55,17 @@ def test_legacy_reflex_controller_k_is_expanded_for_per_layer_trace_accounting()
     assert _effective_k_by_layer({}, shared_k, 2) == ((8, 8, 6, 6), (8, 8, 6, 6))
     layerwise = ((8, 7, 6), (8, 6, 5))
     assert _effective_k_by_layer({"k_by_layer": layerwise}, shared_k, 2) == layerwise
+
+
+def test_summary_reads_canonical_gsm8k_correctness_field(tmp_path):
+    rows = [{
+        "dataset": "gsm8k", "grading": {"canonical_correct": 1},
+        "avg_k": 6.0, "total_pairs": 100, "total_nfe": 20, "wall_seconds": 3.0,
+    }]
+    _write_summary(tmp_path, rows)
+
+    with (tmp_path / "summary.csv").open(encoding="utf-8", newline="") as stream:
+        gsm = next(row for row in csv.DictReader(stream) if row["dataset"] == "gsm8k")
+    assert gsm["correct"] == "1"
+    assert gsm["accuracy"] == "1.0"
 

@@ -324,7 +324,11 @@ def _write_summary(output_dir: Path, rows):
         if not group:
             summary.append({"dataset": name, "completed": 0, "correct": None, "accuracy": None})
             continue
-        correct = [int(row.get("grading", {}).get("correct", 0)) for row in group]
+        correct = [
+            int(row.get("grading", {}).get("canonical_correct",
+                                             row.get("grading", {}).get("correct", 0)))
+            for row in group
+        ]
         summary.append({
             "dataset": name, "completed": len(group), "correct": sum(correct),
             "accuracy": sum(correct) / len(group),
